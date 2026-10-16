@@ -1,0 +1,4 @@
+interface:
+  display_name: "工程模型基准测试"
+  short_description: "从当前或常用工程动态选题，对比模型回答质量、速度、费用与运行波动"
+  default_prompt: "用 $project-model-benchmark 为当前工程选一道常见问题，对比默认模型与思考档，每组运行五次。"
