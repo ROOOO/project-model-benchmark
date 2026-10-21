@@ -15,7 +15,7 @@ import time
 import tomllib
 from urllib.parse import urlparse
 
-from core import BenchmarkError, check_inputs, chosen_attempts, digest, home, inside, metrics, now, read, require, require_sampling_allowed, sha, usage_issues, write
+from core import BenchmarkError, check_inputs, chosen_attempts, digest, home, inside, metrics_for_protocol, now, price_for, read, require, require_sampling_allowed, sha, usage_issues, write
 
 
 class RpcRejected(BenchmarkError):
@@ -111,7 +111,7 @@ def discover_binary(explicit=None):
 class Server:
     def __init__(self, root, binary=None):
         self.root = Path(root)
-        require_sampling_allowed(self.root)
+        protocol = require_sampling_allowed(self.root)
         self.binary = discover_binary(binary)
         config_file = home() / "config.toml"
         conf = tomllib.loads(config_file.read_text(encoding="utf-8-sig")) if config_file.exists() else {}
@@ -123,6 +123,8 @@ class Server:
                             "global_instructions_sha256": sha(home() / "AGENTS.md") if (home() / "AGENTS.md").exists() else None}
         overrides = {"service_tier": "default", "model_reasoning_effort": "max", "web_search": "disabled", "features.shell_tool": False, "features.exec_tool": False,
                      "features.apps": False, "features.plugins": False, "features.multi_agent": False, "features.js_repl": False, "features.code_mode": False}
+        if "priority" in protocol.get("service_tiers", []):
+            overrides["features.fast_mode"] = True
         for name in conf.get("mcp_servers", {}):
             # The Codex override parser splits dotted keys literally; TOML-quoted
             # segments create a different server name instead of quoting it.
@@ -218,7 +220,13 @@ class Server:
         for model in protocol["models"]:
             supported = [e["reasoningEffort"] for e in available.get(model, {}).get("supportedReasoningEfforts", [])]
             missing.extend(f"{model}/{e}" for e in protocol["efforts"] if e not in supported)
-        selected = [{k: m.get(k) for k in ["id", "model", "displayName", "supportedReasoningEfforts"]} for m in models if m.get("model", m.get("id")) in protocol["models"]]
+            if "service_tiers" in protocol:
+                tiers = {t.get("id") for t in available.get(model, {}).get("serviceTiers", [])}
+                missing.extend(f"{model}/service_tier={tier}" for tier in protocol["service_tiers"] if tier != "default" and tier not in tiers)
+        fields = ["id", "model", "displayName", "supportedReasoningEfforts"]
+        if "service_tiers" in protocol:
+            fields += ["serviceTiers", "additionalSpeedTiers", "defaultServiceTier"]
+        selected = [{k: m.get(k) for k in fields} for m in models if m.get("model", m.get("id")) in protocol["models"]]
         result = {"at": now(), "fingerprint": self.fingerprint, "models": selected, "unsupported": missing, "stderr_counts": dict(self.counts), "inference_calls": 0}
         write(self.root / "preflight.json", result)
         require(not missing, "Requested model/effort unsupported: " + ", ".join(missing))
@@ -226,7 +234,8 @@ class Server:
 
     def run_trial(self, item, attempt):
         root = self.root
-        check_inputs(root)
+        protocol = check_inputs(root)
+        tier = item.get("service_tier", "default") if "service_tiers" in protocol else "default"
         directory = root / "runs" / item["id"] / f"attempt-{attempt:03d}"
         directory.mkdir(parents=True, exist_ok=False)
         prompt = (root / "input/prompt.txt").read_text(encoding="utf-8")
@@ -234,6 +243,8 @@ class Server:
         result = {"slot_id": item["id"], "attempt": attempt, "model": item["model"], "effort": item["effort"], "repetition": item["repetition"],
                   "started_at": now(), "status": "starting", "valid": False, "usage": None, "effective": {}, "tool_items": [], "warnings": [],
                   "prompt_sha256": sha(root / "input/prompt.txt"), "fingerprint": self.fingerprint, "actual_gateway_charge": None}
+        if "service_tiers" in protocol:
+            result["service_tier"] = tier
         inflight = {"slot_id": item["id"], "attempt": attempt, "relative_dir": directory.relative_to(root).as_posix(), "pid": os.getpid(),
                     "identity": process_identity(os.getpid()), "server_pid": self.proc.pid, "server_identity": process_identity(self.proc.pid), "created_at": now()}
         write(root / "inflight.json", inflight)
@@ -244,13 +255,13 @@ class Server:
         try:
             require(self.fingerprint["global_instructions_sha256"] == (sha(home() / "AGENTS.md") if (home() / "AGENTS.md").exists() else None), "Global instructions changed during this batch")
             thread = self.rpc("thread/start", {"model": item["model"], "modelProvider": self.provider, "allowProviderModelFallback": False,
-                "serviceTier": "default", "ephemeral": True, "cwd": str(root / "work"), "approvalPolicy": "never", "sandbox": "read-only", "dynamicTools": [],
+                "serviceTier": tier, "ephemeral": True, "cwd": str(root / "work"), "approvalPolicy": "never", "sandbox": "read-only", "dynamicTools": [],
                 "baseInstructions": instructions["base"], "developerInstructions": instructions["developer"],
-                "config": {"model_reasoning_effort": item["effort"], "model_reasoning_summary": "none", "service_tier": "default", "project_doc_max_bytes": 0}, "serviceName": "project_model_benchmark"})
+                "config": {"model_reasoning_effort": item["effort"], "model_reasoning_summary": "none", "service_tier": tier, "project_doc_max_bytes": 0}, "serviceName": "project_model_benchmark"})
             effective = {k: thread.get(k) for k in ["model", "modelProvider", "reasoningEffort", "serviceTier"]}
             effective["instruction_sources_sha256"] = digest(thread.get("instructionSources"))
             result["effective"] = effective
-            require(effective["model"] == item["model"] and effective["reasoningEffort"] == item["effort"] and effective["serviceTier"] == "default" and effective["modelProvider"] == self.provider, "Effective settings differ from requested settings")
+            require(effective["model"] == item["model"] and effective["reasoningEffort"] == item["effort"] and effective["serviceTier"] == tier and effective["modelProvider"] == self.provider, "Effective settings differ from requested settings")
             sources_file = root / "instruction-context.json"
             if sources_file.exists():
                 require(read(sources_file)["sha256"] == effective["instruction_sources_sha256"], "Inherited instruction context changed; start a separate batch")
@@ -263,7 +274,7 @@ class Server:
             self.active = True
             inflight.update(thread_id=tid, submitted_at=now())
             write(root / "inflight.json", inflight)
-            response = self.rpc("turn/start", {"threadId": tid, "model": item["model"], "effort": item["effort"], "summary": "none", "serviceTierForTurn": "default", "input": [{"type": "text", "text": prompt}]})
+            response = self.rpc("turn/start", {"threadId": tid, "model": item["model"], "effort": item["effort"], "summary": "none", "serviceTierForTurn": tier, "input": [{"type": "text", "text": prompt}]})
             turn_id = response["turn"]["id"]
             result["turn_id"] = turn_id
             pending = collections.deque(self.pending)
@@ -278,6 +289,14 @@ class Server:
                     safe = {"t_s": t-start, "method": method}
                     if params.get("model") and params["model"] != item["model"]:
                         result["warnings"].append("Observed model differs from requested model")
+                    if "service_tiers" in protocol:
+                        observed_tier = params.get("serviceTier")
+                        if observed_tier is None and isinstance(params.get("turn"), dict):
+                            observed_tier = params["turn"].get("serviceTier")
+                        if observed_tier is not None:
+                            safe["serviceTier"] = observed_tier
+                            if observed_tier != tier:
+                                result["warnings"].append("Observed service tier differs from requested service tier")
                     if method == "thread/tokenUsage/updated":
                         result["usage"] = params.get("tokenUsage")
                         safe["tokenUsage"] = result["usage"]
@@ -332,8 +351,8 @@ class Server:
             result["warnings"].append("Unexpected tool/approval request")
         result["warnings"].extend(usage_issues(result["usage"]))
         (directory / "answer.txt").write_text(answer, encoding="utf-8", newline="\n")
-        rates = read(root / "prices.json").get("models", {}).get(item["model"])
-        result.update(metrics(result["usage"], elapsed, first, last, answer, rates))
+        rates = price_for(read(root / "prices.json"), item["model"], tier)
+        result.update(metrics_for_protocol(protocol, result["usage"], elapsed, first, last, answer, rates))
         result.update(first_delta_s=first, last_delta_s=last, completed_at=now(), answer_sha256=sha(directory / "answer.txt"), stderr_counts=dict(self.counts))
         result["valid"] = result["status"] == "completed" and bool(answer.strip()) and not result["tool_items"] and not result["warnings"]
         write(directory / "result.json", result)
@@ -367,9 +386,12 @@ def recover_inflight(root):
         answer_file = directory / "answer.txt"
         if not answer_file.exists():
             answer_file.write_text("", encoding="utf-8")
-        write(directory / "result.json", {"slot_id": slot["id"], "attempt": item["attempt"], "model": slot["model"], "effort": slot["effort"], "repetition": slot["repetition"], "status": "interrupted", "valid": False,
+        result = {"slot_id": slot["id"], "attempt": item["attempt"], "model": slot["model"], "effort": slot["effort"], "repetition": slot["repetition"], "status": "interrupted", "valid": False,
               "prompt_sha256": sha(Path(root) / "input/prompt.txt"), "answer_sha256": sha(answer_file), "warnings": ["Previous local processes ended; remote completion unknown; original attempt retained"],
-              "usage": None, **metrics(None, None, answer=answer_file.read_text(encoding="utf-8"))})
+              "usage": None, **metrics_for_protocol(protocol, None, None, answer=answer_file.read_text(encoding="utf-8"))}
+        if "service_tiers" in protocol:
+            result["service_tier"] = slot.get("service_tier", "default")
+        write(directory / "result.json", result)
     path.unlink()
 
 

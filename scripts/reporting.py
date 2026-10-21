@@ -16,12 +16,45 @@ import subprocess
 from urllib.parse import quote, unquote, urlparse
 import zipfile
 
-from core import DIMENSION_LABELS, METRICS, all_attempts, check_inputs, check_sensitive, chosen_attempts, digest, distribution, inside, metrics, now, read, require, scoring_gold, scoring_weights, sha, usage_issues, validate_scores, write
+from core import DIMENSION_LABELS, METRICS, all_attempts, check_inputs, check_sensitive, chosen_attempts, digest, distribution, inside, metric_keys, metrics_for_protocol, now, price_for, protocol_tiers, read, require, scoring_gold, scoring_weights, sha, usage_issues, validate_scores, write
 from runtime import still_running
 
 
 CSV_FIELDS = list(dict.fromkeys(["slot_id", "attempt", "model", "effort", "repetition", "status", "valid", "selected", "accuracy", "readability", "quality", "anonymous_id", "actual_gateway_charge", *METRICS, "answer_link"]))
 CSV_V2_FIELDS = CSV_FIELDS[:9] + ["coverage", "insight"] + CSV_FIELDS[9:] + ["scoring_version", "accuracy_max", "coverage_max", "insight_max", "readability_max", "critical_errors", "errors", "omissions"]
+
+
+def speed_mode(tier):
+    return {"default": "Standard", "priority": "Fast"}[tier]
+
+
+def condition_label(condition, separator=" · "):
+    parts = [condition["model"], condition["effort"]]
+    if "service_tier" in condition:
+        parts.append(speed_mode(condition["service_tier"]))
+    return separator.join(parts)
+
+
+def tier_comparisons(cells, weights):
+    """Compare group medians, without implying per-repetition paired samples."""
+    indexed = {(c["model"], c["effort"], c["service_tier"]): c for c in cells}
+    pairs = []
+    for model, effort in dict.fromkeys((c["model"], c["effort"]) for c in cells):
+        standard = indexed.get((model, effort, "default"))
+        fast = indexed.get((model, effort, "priority"))
+        if standard is None or fast is None:
+            continue
+        comparisons = {}
+        for key in [*weights, "quality", "elapsed_s", "ttft_visible_s", "visible_decode_tps", "output_tokens", "estimated_api_usd"]:
+            a, b = standard["statistics"][key], fast["statistics"][key]
+            known = a["median"] is not None and b["median"] is not None
+            comparisons[key] = {"default": {"n": a["n"], "median": a["median"]},
+                                "priority": {"n": b["n"], "median": b["median"]},
+                                "fast_minus_standard": b["median"] - a["median"] if known else None,
+                                "fast_over_standard": b["median"] / a["median"] if known and a["median"] else None}
+        pairs.append({"model": model, "effort": effort, "default_valid_completed": standard["valid_completed"],
+                      "priority_valid_completed": fast["valid_completed"], "metrics": comparisons})
+    return pairs
 
 
 def idle(root):
@@ -198,34 +231,45 @@ def summarize(root, partial=False):
     scores, detailed_scores = score_data(root, partial)
     gold = scoring_gold(root)
     version, weights = gold.get("scoring_version", 1), scoring_weights(gold)
+    tiered, metric_names = "service_tiers" in p, metric_keys(p)
+    cost_key = "estimated_api_usd" if tiered else "estimated_standard_api_usd"
     attempts, chosen = all_attempts(root), chosen_attempts(root)
     rows, answers = [], []
     for r in attempts:
-        row = {k: r.get(k) for k in ["slot_id", "attempt", "model", "effort", "repetition", "status", "valid", "actual_gateway_charge", *METRICS]}
+        row = {k: r.get(k) for k in ["slot_id", "attempt", "model", "effort", "repetition", "status", "valid", "actual_gateway_charge", *metric_names]}
+        if tiered:
+            row.update(service_tier=r["service_tier"], speed_mode=speed_mode(r["service_tier"]))
         row["selected"] = chosen.get(r["slot_id"], {}).get("relative_result") == r["relative_result"]
         row.update(scores.get(r["relative_result"], {}))
         if version == 2:
             row.update(scoring_version=2, **{k + "_max": v for k, v in weights.items()})
         row["answer_link"] = (Path(r["relative_result"]).parent / "answer.txt").as_posix()
         rows.append(row)
-        answers.append({"label": f"{r['model']} · {r['effort']} · r{r['repetition']} · attempt {r['attempt']} ({r['status']})", "text": inside(root, row["answer_link"]).read_text(encoding="utf-8"), "link": row["answer_link"]})
+        answers.append({"label": condition_label(row) + f" · r{r['repetition']} · attempt {r['attempt']} ({r['status']})", "text": inside(root, row["answer_link"]).read_text(encoding="utf-8"), "link": row["answer_link"]})
+        if tiered:
+            answers[-1].update({k: row[k] for k in ["model", "effort", "service_tier", "speed_mode"]})
     cells = []
     for model in p["models"]:
         for effort in p["efforts"]:
-            all_rows = [r for r in rows if r["model"] == model and r["effort"] == effort]
-            selected = [r for r in all_rows if r["selected"]]
-            good = [r for r in selected if r["valid"] and r["status"] == "completed"]
-            cells.append({"model": model, "effort": effort, "planned": p["repetitions"], "settled": len(selected), "valid_completed": len(good), "attempts": len(all_rows), "failed_attempts": sum(not r["valid"] for r in all_rows),
-                          "statistics": {k: distribution([r.get(k) for r in good]) for k in METRICS + list(weights) + ["quality"]}})
-            if version == 2:
-                cells[-1].update(critical_errors=sum(r.get("critical_errors", 0) for r in good),
-                                 error_answers=sum(r.get("errors", 0) > 0 for r in good), omission_answers=sum(r.get("omissions", 0) > 0 for r in good))
+            for tier in protocol_tiers(p):
+                all_rows = [r for r in rows if r["model"] == model and r["effort"] == effort and (not tiered or r["service_tier"] == tier)]
+                selected = [r for r in all_rows if r["selected"]]
+                good = [r for r in selected if r["valid"] and r["status"] == "completed"]
+                cells.append({"model": model, "effort": effort, "planned": p["repetitions"], "settled": len(selected), "valid_completed": len(good), "attempts": len(all_rows), "failed_attempts": sum(not r["valid"] for r in all_rows),
+                              "statistics": {k: distribution([r.get(k) for r in good]) for k in metric_names + list(weights) + ["quality"]}})
+                if tiered:
+                    cells[-1].update(service_tier=tier, speed_mode=speed_mode(tier), missing=p["repetitions"] - len(selected))
+                if version == 2:
+                    cells[-1].update(critical_errors=sum(r.get("critical_errors", 0) for r in good),
+                                     error_answers=sum(r.get("errors", 0) > 0 for r in good), omission_answers=sum(r.get("omissions", 0) > 0 for r in good))
     success = sum(c["valid_completed"] for c in cells)
     result = {"schema_version": 1, "generated_at": now(), "title": p["title"], "case_id": p["case_id"], "project": p["project"], "batch": root.name, "parent": p.get("parent"),
             "planned": len(p["schedule"]), "settled": len(chosen), "valid_completed": success, "attempt_count": len(attempts), "all_planned_successful": success == len(p["schedule"]),
             "scores_sealed": (root / "grading/seal.json").exists(), "scope": p["scope"], "conditions": cells, "rows": rows, "answers": answers,
-            "known_cost_usd": sum(r["estimated_standard_api_usd"] for r in rows if r.get("estimated_standard_api_usd") is not None), "cost_coverage_attempts": sum(r.get("estimated_standard_api_usd") is not None for r in rows),
+            "known_cost_usd": sum(r[cost_key] for r in rows if r.get(cost_key) is not None), "cost_coverage_attempts": sum(r.get(cost_key) is not None for r in rows),
             "observed_total_elapsed_s": sum(r["elapsed_s"] for r in rows if r.get("elapsed_s") is not None)}
+    if tiered:
+        result.update(schema_version=2, service_tiers=protocol_tiers(p), tier_comparisons=tier_comparisons(cells, weights))
     if version == 2:
         result.update(schema_version=2, scoring_version=2, scoring_weights=weights,
                       grading_details={row["answer_link"]: detailed_scores[row["anonymous_id"]] for row in rows if row.get("anonymous_id")})
@@ -240,7 +284,8 @@ def summarize(root, partial=False):
             require(set(old_rows) == {r["answer_link"] for r in rows}, "Regrade differs from source attempt set")
             for row in rows:
                 old = old_rows[row["answer_link"]]
-                require(all(row.get(k) == old.get(k) for k in METRICS + ["slot_id", "attempt", "model", "effort", "repetition", "status", "valid", "selected", "actual_gateway_charge"]), "Regrade metrics/conditions differ from original")
+                condition_keys = ["slot_id", "attempt", "model", "effort", "repetition", "status", "valid", "selected", "actual_gateway_charge"] + (["service_tier", "speed_mode"] if tiered else [])
+                require(all(row.get(k) == old.get(k) for k in metric_names + condition_keys), "Regrade metrics/conditions differ from original")
     return result
 
 
@@ -296,22 +341,48 @@ def condition_table(cells, weights=None):
     heads = ["组合", "有效/计划", "尝试/失败", *[DIMENSION_LABELS[k] + " /" + str(v) for k, v in weights.items()], "总分 /100", "耗时中位 s", "TTFT 中位 s", "可见 TPS 中位", "输出 token 均值", "费用均值 USD"]
     if "coverage" in weights:
         heads += ["关键错误数", "有错误/遗漏答案数"]
+    if cells and "service_tier" in cells[0]:
+        heads += ["缺失"]
     body = []
     for c in cells:
         s = c["statistics"]
-        values = [html.escape(c["model"] + " · " + c["effort"]), f"{c['valid_completed']}/{c['planned']}", f"{c['attempts']}/{c['failed_attempts']}", *[fmt(s[k]["mean"]) for k in list(weights) + ["quality"]], *[fmt(s[k]["median"]) for k in ["elapsed_s", "ttft_visible_s", "visible_decode_tps"]], fmt(s["output_tokens"]["mean"], 0), fmt(s["estimated_standard_api_usd"]["mean"], 6)]
+        cost_key = "estimated_api_usd" if "service_tier" in c else "estimated_standard_api_usd"
+        values = [html.escape(condition_label(c)), f"{c['valid_completed']}/{c['planned']}", f"{c['attempts']}/{c['failed_attempts']}", *[fmt(s[k]["mean"]) for k in list(weights) + ["quality"]], *[fmt(s[k]["median"]) for k in ["elapsed_s", "ttft_visible_s", "visible_decode_tps"]], fmt(s["output_tokens"]["mean"], 0), fmt(s[cost_key]["mean"], 6)]
         if "coverage" in weights:
             values += [str(c.get("critical_errors", 0)), f"{c.get('error_answers', 0)}/{c.get('omission_answers', 0)}"]
+        if "service_tier" in c:
+            values += [str(c["missing"])]
         body.append("<tr>" + "".join("<td>" + x + "</td>" for x in values) + "</tr>")
     return '<div class="tablewrap"><table><thead><tr>' + "".join("<th>"+h+"</th>" for h in heads) + "</tr></thead><tbody>" + "".join(body) + "</tbody></table></div>"
 
 
-def render_csv(rows, version=1):
+def render_csv(rows, version=1, service_tiers=None):
     output = io.StringIO(newline="")
-    writer = csv.DictWriter(output, fieldnames=CSV_V2_FIELDS if version == 2 else CSV_FIELDS)
+    fields = CSV_V2_FIELDS if version == 2 else CSV_FIELDS
+    if service_tiers is not None:
+        fields = ["estimated_api_usd" if k == "estimated_standard_api_usd" else k for k in fields]
+        fields = fields[:4] + ["service_tier", "speed_mode"] + fields[4:]
+    writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
     writer.writerows(rows)
     return output.getvalue()
+
+
+def tier_comparison_html(data):
+    pairs = data.get("tier_comparisons", [])
+    if not pairs:
+        return ""
+    labels = {"quality": "总分", "elapsed_s": "耗时 s", "ttft_visible_s": "TTFT s", "visible_decode_tps": "可见 TPS", "output_tokens": "输出 token", "estimated_api_usd": "费用 USD"}
+    rows = []
+    for pair in pairs:
+        for key, label in labels.items():
+            metric = pair["metrics"][key]
+            values = [condition_label(pair), label, str(metric["default"]["n"]), fmt(metric["default"]["median"], 6 if key == "estimated_api_usd" else 2),
+                      str(metric["priority"]["n"]), fmt(metric["priority"]["median"], 6 if key == "estimated_api_usd" else 2),
+                      fmt(metric["fast_minus_standard"], 6 if key == "estimated_api_usd" else 2), fmt(metric["fast_over_standard"])]
+            rows.append("<tr>" + "".join("<td>" + html.escape(v) + "</td>" for v in values) + "</tr>")
+    heads = ["模型 / 思考强度", "指标", "Standard n", "Standard 中位数", "Fast n", "Fast 中位数", "Fast − Standard", "Fast / Standard"]
+    return '<section><h2>同模型同思考强度：Standard / Fast</h2><p class="note">比较各组中位数，分别展示实际 n；不是按轮次配对的因果估计。缺值或 Standard 中位数为零时，倍率为 —。</p><div class="tablewrap"><table><thead><tr>' + "".join("<th>" + x + "</th>" for x in heads) + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div></section>"
 
 
 def report_context(root):
@@ -337,7 +408,7 @@ def evaluation_html(data, context):
         old_rows = {r["answer_link"]: r for r in old["rows"]}
         comparison += '<details><summary>逐份新旧总分对照</summary><div class="tablewrap"><table><tr><th>组合/轮次/尝试</th><th>原总分</th><th>V2总分</th></tr>'
         for r in data["rows"]:
-            label = f"{r['model']}/{r['effort']}/r{r['repetition']}/a{r['attempt']}"
+            label = condition_label(r, "/") + f"/r{r['repetition']}/a{r['attempt']}"
             comparison += '<tr><td>'+html.escape(label)+'</td><td>'+fmt(old_rows[r["answer_link"]].get("quality"))+'</td><td>'+fmt(r.get("quality"))+'</td></tr>'
         comparison += '</table></div></details>'
     audit = '<details><summary>V2细则、逐项评分依据与错误/遗漏</summary><pre>' + html.escape(json.dumps(context["scoring_gold"], ensure_ascii=False, indent=2)) + '</pre>'
@@ -346,7 +417,7 @@ def evaluation_html(data, context):
         if score is None:
             continue
         dimensions = " · ".join(f"{DIMENSION_LABELS[key]} {row[key]}/{weight}" for key, weight in data["scoring_weights"].items())
-        audit += '<details><summary>' + html.escape(f"{row['model']}/{row['effort']}/r{row['repetition']} · {dimensions} · 总分 {row['quality']}/100 · 关键错误 {row['critical_errors']}") + '</summary>'
+        audit += '<details><summary>' + html.escape(condition_label(row, "/") + f"/r{row['repetition']} · {dimensions} · 总分 {row['quality']}/100 · 关键错误 {row['critical_errors']}") + '</summary>'
         for item in context["scoring_gold"]["rubric"]:
             key = item["id"]
             audit += '<p><strong>' + html.escape(f"{key} · {DIMENSION_LABELS[item['dimension']]} {score['points'][key]}/{item['max']}") + '</strong> ' + html.escape(score["notes"][key]) + '</p>'
@@ -368,7 +439,7 @@ def render_html(data, context):
     detail = []
     for c in data["conditions"]:
         for name, stat in c["statistics"].items():
-            detail.append("<tr>" + "".join("<td>"+html.escape(str(v))+"</td>" for v in [c["model"]+"/"+c["effort"], name, stat["n"], *[fmt(stat[k], 6) for k in ["mean", "median", "sd", "min", "max"]]]) + "</tr>")
+            detail.append("<tr>" + "".join("<td>"+html.escape(str(v))+"</td>" for v in [condition_label(c, "/"), name, stat["n"], *[fmt(stat[k], 6) for k in ["mean", "median", "sd", "min", "max"]]]) + "</tr>")
     comparison = ""
     if context["parent"] is not None:
         parent = context["parent"]
@@ -392,6 +463,20 @@ def render_html(data, context):
     intro, old_evaluation, audit = evaluation_html(data, context)
     values["TABLE"] = intro + values["TABLE"] + audit
     values["PARENT"] += old_evaluation
+    if "service_tiers" in p:
+        values["TABLE"] += tier_comparison_html(data)
+        filters = '<div class="compare"><div><label for="model-filter">答案模型筛选</label><select id="model-filter"></select><label for="effort-filter">答案思考强度筛选</label><select id="effort-filter"></select></div><div><label for="tier-filter">答案速度模式筛选</label><select id="tier-filter"></select></div></div>'
+        page = page.replace('<h2>答案并排阅读</h2>', '<h2>答案并排阅读</h2>' + filters)
+        script_start = page.index('    const d=JSON.parse(')
+        chart_start = page.index("    const ns='http://www.w3.org/2000/svg'", script_start)
+        selection_script = '''    const d=JSON.parse(document.getElementById('data').textContent);
+    const controls=[['model-filter','model','全部模型'],['effort-filter','effort','全部思考强度'],['tier-filter','service_tier','全部速度模式']];let visible=d.answers;
+    function show(side){const s=document.getElementById(side);document.getElementById(side+'-answer').innerHTML=visible[s.value]?.html||'无匹配答案'}
+    function filterAnswers(){visible=d.answers.filter(a=>controls.every(([id,key])=>!document.getElementById(id).value||a[key]===document.getElementById(id).value));for(const side of ['left','right']){const s=document.getElementById(side);s.replaceChildren();visible.forEach((a,i)=>{const o=document.createElement('option');o.value=i;o.textContent=a.label;s.append(o)});s.selectedIndex=side==='right'&&visible.length>1?1:0;show(side)}}
+    for(const [id,key,label] of controls){const s=document.getElementById(id);const all=document.createElement('option');all.value='';all.textContent=label;s.append(all);for(const value of [...new Set(d.answers.map(a=>a[key]))]){const o=document.createElement('option');o.value=value;o.textContent=key==='service_tier'?(value==='priority'?'Fast':'Standard'):value;s.append(o)}s.selectedIndex=0;s.addEventListener('change',filterAnswers)}for(const side of ['left','right'])document.getElementById(side).addEventListener('change',()=>show(side));filterAnswers();
+'''
+        page = page[:script_start] + selection_script + page[chart_start:]
+        page = page.replace("c.model+'/'+c.effort);", "c.model+'/'+c.effort+'/'+c.speed_mode);")
     return re.sub(r"@@([A-Z_]+)@@", lambda m: values[m[1]], page)
 
 
@@ -400,7 +485,7 @@ def build_report(root, partial=False):
     idle(root)
     data = summarize(root, partial)
     page = render_html(data, report_context(root))
-    table = render_csv(data["rows"], data.get("scoring_version", 1))
+    table = render_csv(data["rows"], data.get("scoring_version", 1), data.get("service_tiers"))
     write(root / "summary.json", data)
     (root / "metrics.csv").write_text(table, encoding="utf-8-sig", newline="")
     (root / "report.html").write_text(page, encoding="utf-8")
@@ -430,6 +515,9 @@ def validate(root, partial=False):
         require(r["slot_id"] in schedule, "Unplanned slot")
         slot = schedule[r["slot_id"]]
         require(r["model"] == slot["model"] and r["effort"] == slot["effort"] and r["repetition"] == slot["repetition"], "Result condition differs from schedule")
+        tier = r.get("service_tier") if "service_tiers" in p else "default"
+        if "service_tiers" in p:
+            require(r.get("service_tier") == slot["service_tier"], "Result service tier differs from schedule")
         directory = inside(root, r["relative_result"]).parent
         answer = (directory / "answer.txt").read_text(encoding="utf-8")
         require(sha(directory / "answer.txt") == r["answer_sha256"] and r["prompt_sha256"] == sha(root / "input/prompt.txt"), "Answer/prompt hash mismatch")
@@ -438,7 +526,7 @@ def validate(root, partial=False):
             tids.add(r["thread_id"])
         if r.get("valid"):
             e = r["effective"]
-            require(r["status"] == "completed" and e["model"] == r["model"] and e["reasoningEffort"] == r["effort"] and e["serviceTier"] == "default" and not r.get("tool_items"), "Invalid effective settings/status/tools")
+            require(r["status"] == "completed" and e["model"] == r["model"] and e["reasoningEffort"] == r["effort"] and e["serviceTier"] == tier and not r.get("tool_items"), "Invalid effective settings/status/tools")
             require(not usage_issues(r.get("usage")), "Invalid reported usage")
             events_file = directory / "events.jsonl"
             require(events_file.exists(), "Missing events for valid result")
@@ -447,8 +535,8 @@ def validate(root, partial=False):
             if ds:
                 require("".join(e["delta"] for e in ds).replace("\r\n", "\n") == answer.replace("\r\n", "\n"), "Stream differs from answer")
                 require(abs(ds[0]["t_s"]-r["first_delta_s"]) < 1e-4 and abs(ds[-1]["t_s"]-r["last_delta_s"]) < 1e-4, "Visible timing inconsistent")
-        recalculated = metrics(r.get("usage"), r.get("elapsed_s"), r.get("first_delta_s"), r.get("last_delta_s"), answer, read(root / "prices.json").get("models", {}).get(r["model"]))
-        for k in METRICS:
+        recalculated = metrics_for_protocol(p, r.get("usage"), r.get("elapsed_s"), r.get("first_delta_s"), r.get("last_delta_s"), answer, price_for(read(root / "prices.json"), r["model"], tier))
+        for k in metric_keys(p):
             a, b = r.get(k), recalculated[k]
             require(a is None and b is None or a is not None and b is not None and math.isclose(a, b, rel_tol=1e-8, abs_tol=1e-7), "Metric inconsistent: " + k)
         check_sensitive(json.dumps(r, ensure_ascii=False))
@@ -460,7 +548,7 @@ def validate(root, partial=False):
         require(isinstance(actual, dict) and {k: v for k, v in actual.items() if k != "generated_at"} == {k: v for k, v in expected.items() if k != "generated_at"}, "Summary differs from raw results")
         with (root / "metrics.csv").open(encoding="utf-8-sig", newline="") as f:
             csv_rows = list(csv.reader(f))
-        expected_csv = list(csv.reader(io.StringIO(render_csv(expected["rows"], expected.get("scoring_version", 1)), newline="")))
+        expected_csv = list(csv.reader(io.StringIO(render_csv(expected["rows"], expected.get("scoring_version", 1), expected.get("service_tiers")), newline="")))
         require(csv_rows == expected_csv, "CSV differs from raw results: headers or rows")
         page = (root / "report.html").read_text(encoding="utf-8")
         require(page == render_html(expected, report_context(root)), "HTML differs from raw results; regenerate with report")

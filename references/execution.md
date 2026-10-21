@@ -71,11 +71,14 @@ case/
 
 无可靠价格时不传 `--prices`，报告费用为未知。输出 token 含 reasoning，不重复计费。估算缓存费用要求输入、缓存读取、缓存写入及输出计数齐全；字段未上报不当作 0。无缓存对照只需输入和输出。Codex credits 单独按其官方口径估算，不加未经验证的缓存写入加价。
 
+速度对照的价格快照使用 `schema_version: 2`，保留顶层 `as_of / sources`，分别在 `service_tiers.default.models` 与 `service_tiers.priority.models` 下按精确 model ID 填写同样的 rate 字段。Fast 缺价不回退 Standard。新批次用 `estimated_api_usd` 表示对应档位估算，旧批次维持原字段与导出格式。API 价格与 Codex purchased credits 按各自官方费率记录，不把订阅额度消耗倍率当作现金费率。
+
 ## 准备、预检、采样
 
 ```text
 benchmark.py prepare --case-dir <case> [--run-dir <new-directory>] [--prices <prices.json>]
 benchmark.py prepare --case-dir <case> --models gpt-6-sol --efforts xhigh max --repetitions 5
+benchmark.py prepare --case-dir <case> --models gpt-6.1-sol gpt-6-astra --efforts xhigh max ultra --service-tiers default fast --repetitions 5 --prices <tier-prices.json>
 benchmark.py preflight --run-dir <run> [--codex <explicit-executable>]
 benchmark.py run --run-dir <run> [--codex <explicit-executable>]
 benchmark.py resume --run-dir <run>
@@ -83,6 +86,8 @@ benchmark.py resume --run-dir <run> --retry-failed
 ```
 
 `prepare` 将输入封存在 `input/`，生成 protocol、种子、计划及哈希；不能覆写已有运行目录。不要编辑封存文件。预检检查全部请求组合，不发起推理，不支持时停止且不自动替换。当前 App 二进制优先，随后已安装 App 和 PATH；可用 `--codex` 明确指定。
+
+`--service-tiers` 接受 `default / fast`（也接受协议名 `priority`）；Fast 封存为 `priority`。省略时新建仍只测 Standard，复测继承父批次速度档。显式速度参数产生含档位的协议；旧协议的计划、评分及报告不原地迁移。含 Fast 时仅对本次运行时启用 Fast feature，预检核验模型目录的速度能力，每次请求严格核对线程回执。报告按模型、思考档、速度档分组，给出各指标中位数的 Fast/Standard 对照。目录和回执只能验证客户端可见能力与设置，不能证明网关内部路由或实扣。
 
 运行输出仅展示总体进度，避免向随后评分者泄露映射。每个计划样本存入 `runs/<slot>/attempt-<n>/`，保留 `result.json / answer.txt / events.jsonl`。发生错误时查看经过脱敏的诊断和进度；不要打印 config/auth/原始 stderr。
 

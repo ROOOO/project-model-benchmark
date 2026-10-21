@@ -13,12 +13,13 @@ from reporting import archive, blind, build_report, seal, validate
 from runtime import Server, execute
 
 
-def retest(parent, output=None, models=None, efforts=None, repetitions=5, prices=None):
+def retest(parent, output=None, models=None, efforts=None, repetitions=5, prices=None, service_tiers=None):
     parent = Path(parent).resolve()
     p = require_sampling_allowed(parent)
     require((parent / "summary.json").exists() and (parent / "grading/seal.json").exists(), "Finish scoring/reporting the parent batch before retesting")
     validate(parent)
-    root = prepare(parent / "input", output, models or p["models"], efforts or p["efforts"], repetitions, prices, parent)
+    tiers = service_tiers if service_tiers is not None else p.get("service_tiers")
+    root = prepare(parent / "input", output, models or p["models"], efforts or p["efforts"], repetitions, prices, parent, tiers)
     q = check_inputs(root)
     require(q["case_id"] == p["case_id"] and q["input_hashes"] == p["input_hashes"], "Retest inputs differ from parent")
     summary = read(parent / "summary.json")
@@ -50,6 +51,7 @@ def parser():
         q.add_argument("--efforts", nargs="+", default=EFFORTS if command == "prepare" else None)
         q.add_argument("--repetitions", type=int, default=5)
         q.add_argument("--prices")
+        q.add_argument("--service-tiers", nargs="+", choices=["default", "fast", "priority"], help="Speed modes; Fast is frozen as priority. Prepare defaults to Standard; retest inherits the parent.")
     for command in ["preflight", "run", "resume", "blind", "seal", "report", "validate"]:
         q = sub.add_parser(command)
         q.add_argument("--run-dir", required=True)
@@ -78,9 +80,9 @@ def main(argv=None):
         value = regrade(args.run_dir, args.rubric, args.output)
     elif args.command in ["prepare", "retest"]:
         if args.command == "prepare":
-            root = prepare(args.case_dir, args.run_dir, args.models, args.efforts, args.repetitions, args.prices)
+            root = prepare(args.case_dir, args.run_dir, args.models, args.efforts, args.repetitions, args.prices, service_tiers=args.service_tiers)
         else:
-            root = retest(args.parent, args.run_dir, args.models, args.efforts, args.repetitions, args.prices)
+            root = retest(args.parent, args.run_dir, args.models, args.efforts, args.repetitions, args.prices, args.service_tiers)
         p = check_inputs(root)
         value = {"run_dir": str(root), "title": p["title"], "planned_calls": len(p["schedule"]), "inference_started": False}
     else:

@@ -152,10 +152,32 @@ def validate_gold(gold):
     return rubric
 
 
-def build_schedule(models, efforts, repetitions, seed):
+def normalize_tiers(tiers):
+    values = ["priority" if t == "fast" else t for t in tiers]
+    require(values and all(t in ("default", "priority") for t in values), "Unsupported service tier; use default or fast")
+    require(len(set(values)) == len(values), "Duplicate service tier")
+    return values
+
+
+def protocol_tiers(protocol):
+    return normalize_tiers(protocol["service_tiers"]) if "service_tiers" in protocol else ["default"]
+
+
+def metric_keys(protocol):
+    return ["estimated_api_usd" if k == "estimated_standard_api_usd" else k for k in METRICS] if "service_tiers" in protocol else list(METRICS)
+
+
+def price_for(snapshot, model, tier="default"):
+    if "service_tiers" in snapshot:
+        return snapshot["service_tiers"].get(tier, {}).get("models", {}).get(model)
+    return snapshot.get("models", {}).get(model) if tier == "default" else None
+
+
+def build_schedule(models, efforts, repetitions, seed, service_tiers=None):
     require(models and efforts and len(set(models)) == len(models) and len(set(efforts)) == len(efforts), "Empty/duplicate model or effort")
     require(repetitions >= 1, "Repetitions must be positive")
-    conditions = [(m, e) for m in models for e in efforts]
+    tiers = normalize_tiers(service_tiers) if service_tiers is not None else None
+    conditions = [(m, e, t) for m in models for e in efforts for t in tiers] if tiers is not None else [(m, e) for m in models for e in efforts]
     rng = random.Random(seed)
     order = list(conditions)
     rng.shuffle(order)
@@ -165,8 +187,12 @@ def build_schedule(models, efforts, repetitions, seed):
         round_order = order[offset:] + order[:offset]
         if repetition % 2 == 0:
             round_order = list(reversed(round_order))
-        for model, effort in round_order:
-            schedule.append({"id": f"{len(schedule)+1:04d}", "model": model, "effort": effort, "repetition": repetition})
+        for condition in round_order:
+            model, effort = condition[:2]
+            slot = {"id": f"{len(schedule)+1:04d}", "model": model, "effort": effort, "repetition": repetition}
+            if tiers is not None:
+                slot["service_tier"] = condition[2]
+            schedule.append(slot)
     return schedule
 
 
@@ -177,12 +203,20 @@ def load_prices(path=None):
     require(bool(data.get("as_of")) and bool(data.get("sources")), "Prices need date and official sources")
     from urllib.parse import urlparse
     require(all(urlparse(u).scheme == "https" and urlparse(u).hostname in {"developers.openai.com", "platform.openai.com", "learn.chatgpt.com"} for u in data["sources"]), "Rate sources must be official OpenAI pages")
-    for rates in data.get("models", {}).values():
+    if "service_tiers" in data:
+        require(data.get("schema_version") == 2, "Unknown tier price schema")
+        require(isinstance(data["service_tiers"], dict), "Invalid tier price snapshot")
+        normalize_tiers(list(data["service_tiers"]))
+        require(all(t in ("default", "priority") for t in data["service_tiers"]), "Price snapshots use canonical service tiers")
+        rates_list = [r for tier in data["service_tiers"].values() for r in tier.get("models", {}).values()]
+    else:
+        rates_list = list(data.get("models", {}).values())
+    for rates in rates_list:
         require(all(isinstance(v, (int, float)) and math.isfinite(v) and v >= 0 for v in rates.values()), "Invalid price rate")
     return data
 
 
-def prepare(case_dir, output=None, models=None, efforts=None, repetitions=5, prices=None, parent=None):
+def prepare(case_dir, output=None, models=None, efforts=None, repetitions=5, prices=None, parent=None, service_tiers=None):
     source = Path(case_dir).resolve()
     case = read(source / "case.json")
     gold = read(source / "gold.json")
@@ -212,7 +246,8 @@ def prepare(case_dir, output=None, models=None, efforts=None, repetitions=5, pri
         check_sensitive(text)
     models, efforts = list(models or MODELS), list(efforts or EFFORTS)
     seed = secrets.randbits(48)
-    schedule = build_schedule(models, efforts, repetitions, seed)
+    tiers = normalize_tiers(service_tiers) if service_tiers is not None else None
+    schedule = build_schedule(models, efforts, repetitions, seed, tiers)
     pricing = load_prices(prices)
     if output:
         root = Path(output).expanduser().resolve()
@@ -246,6 +281,9 @@ def prepare(case_dir, output=None, models=None, efforts=None, repetitions=5, pri
                 "seed": seed, "schedule": schedule, "input_hashes": hashes, "prices_sha256": sha(root / "prices.json"),
                 "instructions_sha256": sha(bundle / "instructions.json"), "parent": str(Path(parent).resolve()) if parent else None,
                 "scope": "Fixed-evidence analysis only; no retrieval, tools or delegation. AI rubric scoring; not human preference research."}
+    if tiers is not None:
+        protocol.update(schema_version=2, service_tiers=tiers)
+        protocol.pop("service_tier")
     write(root / "protocol.json", protocol)
     if parent:
         protocol["case_id"] = parent_protocol["case_id"]
@@ -261,7 +299,7 @@ def check_inputs(root):
     for name, expected in p["input_hashes"].items():
         require(sha(inside(root / "input", name)) == expected, f"Frozen input changed: {name}")
     require(sha(root / "prices.json") == p["prices_sha256"], "Frozen rate snapshot changed")
-    expected = read(root / "input/historical-schedule.json") if p.get("historical_import") else build_schedule(p["models"], p["efforts"], p["repetitions"], p["seed"])
+    expected = read(root / "input/historical-schedule.json") if p.get("historical_import") else build_schedule(p["models"], p["efforts"], p["repetitions"], p["seed"], p.get("service_tiers"))
     require(p["schedule"] == expected, "Schedule changed")
     if p.get("offline_regrade"):
         manifest = read(root / "evaluation/manifest.json")
@@ -351,6 +389,13 @@ def metrics(usage, elapsed, first=None, last=None, answer="", rates=None):
     if None not in [i, c, o] and c <= i and all(k in rates for k in ["input_credits", "cached_credits", "output_credits"]):
         out["estimated_codex_credits"] = ((i-c)*rates["input_credits"] + c*rates["cached_credits"] + o*rates["output_credits"]) / 1e6
     return out
+
+
+def metrics_for_protocol(protocol, usage, elapsed, first=None, last=None, answer="", rates=None):
+    result = metrics(usage, elapsed, first, last, answer, rates)
+    if "service_tiers" in protocol:
+        result["estimated_api_usd"] = result.pop("estimated_standard_api_usd")
+    return result
 
 
 def distribution(values):

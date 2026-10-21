@@ -7,6 +7,8 @@ description: 从当前工程或本机常用工程动态选择常见问题，使�
 
 把真实工程问题变成可验证、可复测的固定证据实验。默认 `gpt-6.1-sol / gpt-6-astra / gpt-6-sol` × `xhigh / max / ultra` × 每组 5 次，共 45 次，Standard、关闭 Fast，串行执行。用户可覆盖这些参数。
 
+需要速度对照时用 `--service-tiers default fast`，按模型 × 思考档 × 速度档分别统计；Fast 在当前 app-server 协议中封存为 `priority`。只覆盖本批次参数，不修改用户的 Codex 默认配置。
+
 创建、解释或修改本 skill 不启动付费测试；用户要求运行 benchmark 时，完成准备后直接执行已授权矩阵，无需重复确认。
 
 脚本入口为本 skill 的 `scripts/benchmark.py`，Python 3.11+，仅使用标准库。首次执行或调整参数读 [执行接口](references/execution.md)；选题与评分读 [实验方法](references/methodology.md)。不要重写一套临时 runner。
