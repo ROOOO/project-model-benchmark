@@ -505,10 +505,10 @@ class Links(HTMLParser):
             self.links.append(attrs["href"])
 
 
-def validate(root, partial=False):
+def validate_records(root):
+    """Read-only transport, answer, usage and metric checks shared by exporters."""
     root = Path(root)
     p = check_inputs(root)
-    score_data(root, partial)
     attempts, tids = all_attempts(root), set()
     schedule = {s["id"]: s for s in p["schedule"]}
     for r in attempts:
@@ -541,6 +541,14 @@ def validate(root, partial=False):
             require(a is None and b is None or a is not None and b is not None and math.isclose(a, b, rel_tol=1e-8, abs_tol=1e-7), "Metric inconsistent: " + k)
         check_sensitive(json.dumps(r, ensure_ascii=False))
         check_sensitive(answer)
+    return attempts
+
+
+def validate(root, partial=False):
+    root = Path(root)
+    p = check_inputs(root)
+    score_data(root, partial)
+    attempts = validate_records(root)
     exports = [root / name for name in ["summary.json", "metrics.csv", "report.html"]]
     if any(path.exists() for path in exports):
         require(all(path.is_file() for path in exports), "Incomplete report artifacts; regenerate with report")

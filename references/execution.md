@@ -49,7 +49,7 @@ case/
 }
 ```
 
-`gold.json` 必须有 `reference_facts`、`verification`、`rubric`。`verification` 记录实际执行或静态对照的方法、结果与可复核依据，不能写未运行的验证。rubric 每项有 `id / dimension / max / criterion`。新题默认声明 `scoring_version: 2`，dimension 为 `accuracy / coverage / insight / readability`，合计分别为50/20/10/20。未声明或明确为1时保持旧70/30，未知版本拒绝。具体事实、必答要点和允许洞察随题目生成；不得把模型答案当标准答案。
+`gold.json` 必须有 `reference_facts`、`verification`、`rubric`。`verification` 记录实际执行或静态对照的方法、结果与可复核依据，不能写未运行的验证。rubric 每项有 `id / dimension / max / criterion`。新题默认声明 `scoring_version: 2`，dimension 为 `accuracy / coverage / insight / readability`，合计分别为50/20/10/20。未声明或明确为1时保持旧70/30，未知版本拒绝。具体事实、必答要点和可选推导随题目生成；洞察按实验方法的深度锚点细化，不按机制名称给分，不固定子项数量。不得把模型答案当标准答案。
 
 ```json
 {
@@ -59,7 +59,7 @@ case/
   "rubric": [
     {"id": "A1", "dimension": "accuracy", "max": 50, "criterion": "已陈述的关键事实、因果与建议是否正确；具体错误及扣分锚点须随题细化"},
     {"id": "C1", "dimension": "coverage", "max": 20, "criterion": "按本题必答清单检查遗漏与部分回应，错误不重复扣覆盖"},
-    {"id": "I1", "dimension": "insight", "max": 10, "criterion": "材料支持的有用边界洞察；列出允许洞察及具体分值，不按长度计分"},
+    {"id": "I1", "dimension": "insight", "max": 10, "criterion": "材料支持的额外推导；预先固定数量、深度锚点及计分规则，允许零分"},
     {"id": "R1", "dimension": "readability", "max": 20, "criterion": "结论组织、自然表达、详略与易执行性"}
   ]
 }
@@ -150,6 +150,15 @@ benchmark.py run --run-dir <new-run>
 ```
 
 `retest` 只准备新批次，沿用原题、摘录、指令和 gold，默认每组 5 次，可覆盖模型与档位。父批次须已评分并生成报告。价格快照须重新核对，不传时标未知。父批次统计单独嵌入新报告，不复制全部私有历史答案、不合并抽样；环境变化会提示。
+
+## 已有批次离线比较
+
+```text
+benchmark.py compare --run-dirs <sealed-run> --output <new-directory>
+benchmark.py compare --run-dirs <run-a> <run-b> --output <new-directory> --models <model-id> <model-id> --assessment <assessment.json>
+```
+
+该命令只读取已有封存输入、答案、评分及性能，不发起模型调用、不调用会回写来源的 `report / validate`。输出必须为独立新目录；`--models` 使用精确 model ID，不传则保留全部模型。`--assessment` 沿用 `conclusion / evidence / limitations` 格式，不提供时使用中性说明。输入范围、比较口径、图表与校验文件见 [离线综合报告](comparison.md)。
 
 ## 维护验证
 

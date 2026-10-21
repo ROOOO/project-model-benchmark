@@ -9,6 +9,7 @@ import sys
 
 from core import BenchmarkError, EFFORTS, MODELS, check_inputs, home, prepare, read, require, require_sampling_allowed, select_project, write
 from evaluation import regrade
+from comparison import compare
 from reporting import archive, blind, build_report, seal, validate
 from runtime import Server, execute
 
@@ -43,6 +44,11 @@ def parser():
     revision.add_argument("--run-dir", required=True)
     revision.add_argument("--rubric", required=True)
     revision.add_argument("--output", required=True)
+    comparison = sub.add_parser("compare", help="Create a separate offline comparison from sealed runs; never starts inference")
+    comparison.add_argument("--run-dirs", nargs="+", required=True)
+    comparison.add_argument("--output", required=True)
+    comparison.add_argument("--models", nargs="+")
+    comparison.add_argument("--assessment", help="JSON with conclusion, evidence and limitations; omitted uses neutral notes")
     for command in ["prepare", "retest"]:
         q = sub.add_parser(command, help="Prepare a new batch; never starts inference")
         q.add_argument("--case-dir" if command == "prepare" else "--parent", required=True)
@@ -78,6 +84,8 @@ def main(argv=None):
         value = [{k: p.get(k) for k in ["title", "project", "case_id", "created_at"]} for f in sorted(Path(args.root).glob("*/protocol.json")) if (p := read(f))]
     elif args.command == "regrade":
         value = regrade(args.run_dir, args.rubric, args.output)
+    elif args.command == "compare":
+        value = compare(args.run_dirs, args.output, args.models, args.assessment)
     elif args.command in ["prepare", "retest"]:
         if args.command == "prepare":
             root = prepare(args.case_dir, args.run_dir, args.models, args.efforts, args.repetitions, args.prices, service_tiers=args.service_tiers)
