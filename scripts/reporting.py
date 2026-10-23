@@ -12,6 +12,7 @@ import random
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 from urllib.parse import quote, unquote, urlparse
 import zipfile
@@ -22,6 +23,183 @@ from runtime import still_running
 
 CSV_FIELDS = list(dict.fromkeys(["slot_id", "attempt", "model", "effort", "repetition", "status", "valid", "selected", "accuracy", "readability", "quality", "anonymous_id", "actual_gateway_charge", *METRICS, "answer_link"]))
 CSV_V2_FIELDS = CSV_FIELDS[:9] + ["coverage", "insight"] + CSV_FIELDS[9:] + ["scoring_version", "accuracy_max", "coverage_max", "insight_max", "readability_max", "critical_errors", "errors", "omissions"]
+AGENTIC_METRICS = (
+    "answer_ready_s", "root_turn_completed_s", "workflow_elapsed_s", "first_progress_s", "final_ttft_s", "delegation_count", "root_output_e2e_tps", "tree_output_e2e_tps",
+    *tuple(prefix + key for prefix in ("root_", "child_", "tree_")
+           for key in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_tokens",
+                       "observed_input_tokens", "observed_cached_input_tokens", "observed_cache_write_input_tokens", "observed_output_tokens", "observed_reasoning_tokens",
+                       "estimated_api_usd", "observed_api_usd")),
+)
+AGENTIC_FLAGS = ("delegation_occurred", "accounting_complete", "pricing_complete")
+
+
+def execution_identity(protocol, fingerprint=None):
+    """A stable comparison identity, excluding per-run physical work paths."""
+    profile = protocol.get("execution_profile") or {"mode": "fixed-evidence"}
+    mode = profile.get("mode", "fixed-evidence")
+    if mode == "fixed-evidence":
+        return mode, digest({"mode": mode})
+    require(mode == "project-readonly", "Unknown execution mode")
+    identity = profile.get("comparison_fingerprint")
+    require(isinstance(identity, str) and bool(re.fullmatch(r"[0-9a-f]{64}", identity)),
+            "Project-readonly profile needs a frozen comparison fingerprint")
+    environment = None
+    if fingerprint is not None:
+        require(isinstance(fingerprint, dict), "Malformed runtime fingerprint")
+        state = fingerprint.get("execution", {})
+        environment = {k: fingerprint.get(k) for k in ("binary_sha256", "provider", "endpoint_host", "global_instructions_sha256")}
+        environment["execution"] = {k: state.get(k) for k in ("agent_settings", "agent_roles_sha256", "feature_overrides",
+                                                           "models", "catalog_client_version", "native_defaults")}
+        environment["execution"].update({k: state[k] for k in ("instruction_sources_sha256", "inherited_config_sha256",
+                                                              "model_catalog_sha256", "binary_companions_sha256",
+                                                              "effective_configuration_fingerprint", "effective_native_settings") if k in state})
+    return mode, digest({"execution_profile": identity, "instructions_sha256": protocol.get("instructions_sha256"),
+                         "runtime_environment": environment})
+
+
+def runtime_fingerprint(root):
+    path = Path(root) / "runtime.json"
+    return read(path).get("fingerprint") if path.is_file() else None
+
+
+def check_artifact_sensitive(path, binary_source=False):
+    """Scan frozen source bytes without requiring the source's encoding to change."""
+    data = Path(path).read_bytes()
+    if binary_source:
+        # ASCII credential patterns remain intact in UTF-8, GB2312 and binaries.
+        decoded = data.decode("latin-1")
+        check_sensitive(decoded)
+        check_sensitive(decoded.replace("\x00", ""))
+        if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+            check_sensitive(data.decode("utf-16"))
+    else:
+        check_sensitive(data.decode("utf-8-sig"))
+
+
+def native_evidence_files(root):
+    """Allowlist native capability receipts and archived scratch; never follow links."""
+    root = Path(root)
+    if execution_identity(read(root / "protocol.json"))[0] != "project-readonly":
+        return []
+
+    def no_links(path):
+        require(path.resolve().is_relative_to(root.resolve()), "Native evidence escapes run")
+        for entry in (path, *path.parents):
+            if entry == root:
+                break
+            attributes = getattr(entry.lstat(), "st_file_attributes", 0)
+            require(not entry.is_symlink() and not (attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT),
+                    "Native evidence contains a link or reparse point")
+            require(not entry.is_file() or entry.lstat().st_nlink == 1, "Native evidence contains a hardlink alias")
+
+    def attempt_dirs(directory):
+        if not directory.exists() and not directory.is_symlink():
+            return
+        no_links(directory)
+        for group in sorted(directory.iterdir()):
+            no_links(group)
+            if group.is_dir():
+                for attempt in sorted(group.iterdir()):
+                    no_links(attempt)
+                    if attempt.name.startswith("attempt-") and attempt.is_dir():
+                        yield attempt
+
+    def scratch_files(directory):
+        if not directory.exists() and not directory.is_symlink():
+            return
+        no_links(directory)
+        require(directory.is_dir(), "Archived scratch must be a directory")
+        for entry in sorted(directory.iterdir()):
+            no_links(entry)
+            if entry.is_dir():
+                yield from scratch_files(entry)
+            else:
+                require(entry.is_file(), "Unsupported archived scratch entry")
+                yield entry
+
+    files = []
+    capability = root / "capability"
+    if capability.exists() or capability.is_symlink():
+        no_links(capability)
+        seal = capability / "seal.json"
+        if seal.is_file():
+            no_links(seal)
+            files.append(seal)
+        # Recovery is a new derived record, not a replacement execution. Retain
+        # its receipt and the exact original attempt alongside the repaired
+        # canonical result, without admitting unrelated files into exports.
+        for relative in ("recovery/receipt.json", *("recovery/source/" + name for name in
+                         ("answer.txt", "result.json", "events.jsonl", "task-tree.json", "protocol.json",
+                          "preparation-seal.json", "prices.json", "runtime.json", "preflight.json",
+                          "permission-probe.json", "permission-probe-seal.json", "instruction-context.json"))):
+            path = capability / relative
+            if path.exists() or path.is_symlink():
+                no_links(path)
+                require(path.is_file(), "Capability recovery evidence must be a file")
+                files.append(path)
+        for directory in attempt_dirs(capability / "runs"):
+            for name in ("answer.txt", "result.json", "events.jsonl", "task-tree.json"):
+                path = directory / name
+                if path.is_file():
+                    no_links(path)
+                    files.append(path)
+            files.extend(scratch_files(directory / "scratch"))
+    for directory in attempt_dirs(root / "runs"):
+        files.extend(scratch_files(directory / "scratch"))
+    return sorted(set(files))
+
+
+def capability_summary(root):
+    """Capability checks are paid evidence, separate from formal sample statistics."""
+    root = Path(root)
+    seal_path = root / "capability/seal.json"
+    records = {path.relative_to(root / "capability").as_posix(): read(path) for path in native_evidence_files(root)
+               if path.name == "result.json" and path.is_relative_to(root / "capability/runs")}
+    if not seal_path.is_file() and not records:
+        return None
+    seal = read(seal_path) if seal_path.is_file() else {}
+    if seal.get("passed") is True:
+        from agentic_runtime import require_capability
+        require_capability(root, seal.get("fingerprint", {}))
+    def cost_values(selected, field):
+        return [r[field] for r in selected if r.get(field) is not None]
+
+    def cost_sum(values):
+        return sum(values) if values else None
+
+    complete = cost_values(records.values(), "tree_estimated_api_usd")
+    observed = cost_values(records.values(), "tree_observed_api_usd")
+    origins = seal.get("attempt_origins", {})
+    historical_names = {name for name, record in records.items()
+                        if origins.get(name, {}).get("kind") == "historical-paid-offline-replay"
+                        or record.get("replay_provenance", {}).get("kind") == "historical-paid-offline-replay"}
+    historical = [record for name, record in records.items() if name in historical_names]
+    new = [record for name, record in records.items() if name not in historical_names]
+    historical_complete = cost_values(historical, "tree_estimated_api_usd")
+    historical_observed = cost_values(historical, "tree_observed_api_usd")
+    new_complete = cost_values(new, "tree_estimated_api_usd")
+    new_observed = cost_values(new, "tree_observed_api_usd")
+    replay_receipt = root / "capability/recovery/receipt.json"
+    replay_checks = seal.get("replay_checks", 1 if replay_receipt.is_file() else 0)
+    local_new_attempts = 0 if seal.get("paid_here") is False else len(new)
+    return {"capability_id": seal.get("capability_id"), "compatibility_id": seal.get("compatibility_id"),
+            "passed": seal.get("passed", False), "paid_here": seal.get("paid_here"), "shared_from": seal.get("shared_from"),
+            "attempts": seal.get("attempts", local_new_attempts), "archived_attempts": len(records),
+            "verified_attempts": seal.get("verified_attempts", len(records)), "formal_samples": 0,
+            "known_complete_cost_usd": cost_sum(complete), "complete_cost_attempts": len(complete),
+            "known_observed_cost_usd": cost_sum(observed), "observed_cost_attempts": len(observed),
+            "paid_ledger_attempts": len(records), "historical_paid_attempts": len(historical),
+            "origin_new_paid_attempts": len(new), "new_paid_attempts": local_new_attempts,
+            "replay_checks": replay_checks, "replay_inference_calls": 0, "replay_added_api_usd": 0.0,
+            "historical_known_complete_cost_usd": cost_sum(historical_complete) if historical else 0.0,
+            "historical_complete_cost_attempts": len(historical_complete),
+            "historical_known_observed_cost_usd": cost_sum(historical_observed) if historical else 0.0,
+            "new_known_complete_cost_usd": cost_sum(new_complete) if new else 0.0, "new_complete_cost_attempts": len(new_complete),
+            "new_known_observed_cost_usd": cost_sum(new_observed) if new else 0.0,
+            "local_known_complete_cost_usd": 0.0 if not local_new_attempts else cost_sum(new_complete),
+            "local_known_observed_cost_usd": 0.0 if not local_new_attempts else cost_sum(new_observed),
+            "actual_gateway_charge": None,
+            "cost_scope": "Separate capability verification; not included in formal sample costs. Canonical paid attempts are counted once; offline replay adds no inference cost. Shared capability_id is counted once. Gateway charge is unknown."}
 
 
 def speed_mode(tier):
@@ -232,11 +410,16 @@ def summarize(root, partial=False):
     gold = scoring_gold(root)
     version, weights = gold.get("scoring_version", 1), scoring_weights(gold)
     tiered, metric_names = "service_tiers" in p, metric_keys(p)
+    agentic = execution_identity(p)[0] == "project-readonly"
+    if agentic:
+        metric_names = list(dict.fromkeys([*metric_names, *AGENTIC_METRICS]))
     cost_key = "estimated_api_usd" if tiered else "estimated_standard_api_usd"
     attempts, chosen = all_attempts(root), chosen_attempts(root)
     rows, answers = [], []
     for r in attempts:
         row = {k: r.get(k) for k in ["slot_id", "attempt", "model", "effort", "repetition", "status", "valid", "actual_gateway_charge", *metric_names]}
+        if agentic:
+            row.update({k: r.get(k) for k in AGENTIC_FLAGS})
         if tiered:
             row.update(service_tier=r["service_tier"], speed_mode=speed_mode(r["service_tier"]))
         row["selected"] = chosen.get(r["slot_id"], {}).get("relative_result") == r["relative_result"]
@@ -262,12 +445,26 @@ def summarize(root, partial=False):
                 if version == 2:
                     cells[-1].update(critical_errors=sum(r.get("critical_errors", 0) for r in good),
                                      error_answers=sum(r.get("errors", 0) > 0 for r in good), omission_answers=sum(r.get("omissions", 0) > 0 for r in good))
+                if agentic:
+                    observed = [r for r in good if isinstance(r.get("delegation_occurred"), bool)]
+                    cells[-1].update(delegation_observed_answers=len(observed),
+                                     delegated_answers=sum(r["delegation_occurred"] for r in observed),
+                                     delegation_rate=sum(r["delegation_occurred"] for r in observed) / len(observed) if observed else None,
+                                     accounting_complete_attempts=sum(r.get("accounting_complete") is True for r in all_rows),
+                                     known_observed_cost_usd=sum(r["tree_observed_api_usd"] for r in all_rows if r.get("tree_observed_api_usd") is not None),
+                                     observed_cost_coverage_attempts=sum(r.get("tree_observed_api_usd") is not None for r in all_rows))
     success = sum(c["valid_completed"] for c in cells)
     result = {"schema_version": 1, "generated_at": now(), "title": p["title"], "case_id": p["case_id"], "project": p["project"], "batch": root.name, "parent": p.get("parent"),
             "planned": len(p["schedule"]), "settled": len(chosen), "valid_completed": success, "attempt_count": len(attempts), "all_planned_successful": success == len(p["schedule"]),
             "scores_sealed": (root / "grading/seal.json").exists(), "scope": p["scope"], "conditions": cells, "rows": rows, "answers": answers,
             "known_cost_usd": sum(r[cost_key] for r in rows if r.get(cost_key) is not None), "cost_coverage_attempts": sum(r.get(cost_key) is not None for r in rows),
             "observed_total_elapsed_s": sum(r["elapsed_s"] for r in rows if r.get("elapsed_s") is not None)}
+    if agentic:
+        result.update(execution_mode="project-readonly", execution_profile_id=execution_identity(p, runtime_fingerprint(root))[1],
+                      capability_verification=capability_summary(root),
+                      accounting_complete_attempts=sum(r.get("accounting_complete") is True for r in rows),
+                      known_observed_cost_usd=sum(r["tree_observed_api_usd"] for r in rows if r.get("tree_observed_api_usd") is not None),
+                      observed_cost_coverage_attempts=sum(r.get("tree_observed_api_usd") is not None for r in rows))
     if tiered:
         result.update(schema_version=2, service_tiers=protocol_tiers(p), tier_comparisons=tier_comparisons(cells, weights))
     if version == 2:
@@ -362,6 +559,8 @@ def render_csv(rows, version=1, service_tiers=None):
     if service_tiers is not None:
         fields = ["estimated_api_usd" if k == "estimated_standard_api_usd" else k for k in fields]
         fields = fields[:4] + ["service_tier", "speed_mode"] + fields[4:]
+    if any("accounting_complete" in row for row in rows):
+        fields = list(dict.fromkeys([*fields, *AGENTIC_METRICS, *AGENTIC_FLAGS]))
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
     writer.writerows(rows)
@@ -383,6 +582,33 @@ def tier_comparison_html(data):
             rows.append("<tr>" + "".join("<td>" + html.escape(v) + "</td>" for v in values) + "</tr>")
     heads = ["模型 / 思考强度", "指标", "Standard n", "Standard 中位数", "Fast n", "Fast 中位数", "Fast − Standard", "Fast / Standard"]
     return '<section><h2>同模型同思考强度：Standard / Fast</h2><p class="note">比较各组中位数，分别展示实际 n；不是按轮次配对的因果估计。缺值或 Standard 中位数为零时，倍率为 —。</p><div class="tablewrap"><table><thead><tr>' + "".join("<th>" + x + "</th>" for x in heads) + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div></section>"
+
+
+def agentic_html(data):
+    if data.get("execution_mode") != "project-readonly":
+        return ""
+    heads = ["组合", "委派答案/已观测", "子代理数中位", "答案就绪 s", "全任务 s", "首次进度 s", "正文首字 s",
+             "主/子/全树输出 token 中位", "根/全树端到端输出 token/s 中位", "主/子/全树费用均值 USD", "计量完整尝试", "已观测费用合计 USD"]
+    rows = []
+    for cell in data["conditions"]:
+        stats = cell["statistics"]
+        median = lambda key: fmt(stats.get(key, {}).get("median"))
+        values = [condition_label(cell), f"{cell['delegated_answers']}/{cell['delegation_observed_answers']}",
+                  median("delegation_count"), *[median(k) for k in ("answer_ready_s", "workflow_elapsed_s", "first_progress_s", "final_ttft_s")],
+                  " / ".join(fmt(stats.get(p + "output_tokens", {}).get("median"), 0) for p in ("root_", "child_", "tree_")),
+                  " / ".join(median(k) for k in ("root_output_e2e_tps", "tree_output_e2e_tps")),
+                  " / ".join(fmt(stats.get(p + "estimated_api_usd", {}).get("mean"), 6) for p in ("root_", "child_", "tree_")),
+                  f"{cell['accounting_complete_attempts']}/{cell['attempts']}",
+                  fmt(cell["known_observed_cost_usd"] if cell["observed_cost_coverage_attempts"] else None, 6)]
+        rows.append("<tr>" + "".join("<td>" + html.escape(v) + "</td>" for v in values) + "</tr>")
+    capability = data.get("capability_verification")
+    note = ""
+    if capability:
+        shared = "复用同一能力验收记录；本批新增能力验收费用为零，下列费用属于历史验收。" if capability.get("paid_here") is False else "能力验收费用与正式样本分列。"
+        note = '<p class="note">能力验收：本批 ' + html.escape(str(capability["attempts"])) + ' 次，留档 ' + html.escape(str(capability["archived_attempts"])) + ' 次。' + shared + '完整费用可估 ' + str(capability["complete_cost_attempts"]) + '/' + str(capability["archived_attempts"]) + '，已知合计 USD ' + fmt(capability["known_complete_cost_usd"], 6) + '；部分已观测费用 USD ' + fmt(capability["known_observed_cost_usd"], 6) + '。不计入正式样本统计；相同 capability_id 只计一次。</p>'
+        if capability.get("replay_checks"):
+            note += '<p class="note">恢复账本：历史付费尝试 ' + str(capability["historical_paid_attempts"]) + ' 次，经零调用离线复核 ' + str(capability["replay_checks"]) + ' 次；复核新增推理费用 USD 0。历史尝试的修复后完整费用估算 USD ' + fmt(capability["historical_known_complete_cost_usd"], 7) + '。原失败记录随档保留，不再计第二笔费用。本批新增付费验收 ' + str(capability["new_paid_attempts"]) + ' 次，本批已知完整费用估算 USD ' + fmt(capability["local_known_complete_cost_usd"], 7) + '；付费账本共 ' + str(capability["paid_ledger_attempts"]) + ' 次。实际网关扣费未知。</p>'
+    return '<section><h2>原生代理工作流与全树消耗</h2><p class="note">零委派是有效观测。主代理与子孙代理分别计量；费用按各响应实际模型与速度档估算。已观测费用包含失败尝试，只是已知部分，不等于完整总费用。正文 TPS 不使用全树输出量。</p>' + note + '<div class="tablewrap"><table><thead><tr>' + "".join("<th>" + x + "</th>" for x in heads) + '</tr></thead><tbody>' + "".join(rows) + '</tbody></table></div></section>'
 
 
 def report_context(root):
@@ -451,6 +677,10 @@ def render_html(data, context):
     payload = json.dumps({"answers": [{**a, "html": markdown(a["text"])} for a in data["answers"]], "cells": data["conditions"]}, ensure_ascii=False).replace("<", "\\u003c").replace("&", "\\u0026")
     evidence = "".join("<li>"+html.escape(str(x))+"</li>" for x in assessment.get("evidence", []))
     limits = ["单题、小样本；AI 评分，不是人工偏好研究。", "同一固定证据，不衡量搜索、工具使用、代码修改或自动委派。", "TPS = 可见输出 token / 首末非空可见 delta 间隔，受客户端缓冲影响，不是纯后端解码速率。", "总耗时从 turn/start 发出到 turn/completed 收到，含排队、网络、思考和输出；不含建会话和评分。", "费用按官方快照估算，不等于自建网关扣费；无缓存口径保留同次输出用量，仅是输入计费对照。", "缺失值为 —；统计 n 可能小于有效答案数，费用总计只覆盖已知项。"] + assessment.get("limitations", [])
+    if data.get("execution_mode") == "project-readonly":
+        limits[1:4] = ["在冻结工程源码及相同可用工具下进行只读分析，保留原生委派策略；不评价业务代码修改。",
+                       "答案就绪与全任务结束分别计时；正文首字与首次进度分别报告。根输出 TPS 仅在用量可归属时提供，不能把全树输出除以根答案时长。",
+                       "全树用量按唯一响应去重；未收齐响应或未知价格保留未知，已观测消耗单列。"]
     limit_html = "".join("<li>"+html.escape(str(x))+"</li>" for x in limits)
     raw = "".join('<details><summary>'+html.escape(a["label"])+'</summary><a href="'+quote(a["link"], safe="/")+'">原始答案</a><article>'+markdown(a["text"])+'</article></details>' for a in data["answers"])
     page = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>工程模型 Benchmark</title><style>
@@ -461,7 +691,7 @@ def render_html(data, context):
     </script></body></html>'''
     values = {"TITLE": html.escape(data["title"]), "BATCH": html.escape(data["batch"]), "PROJECT": html.escape(data["project"].get("name", data["project"]["root"])), "VALID": str(data["valid_completed"]), "PLANNED": str(data["planned"]), "ATTEMPTS": str(data["attempt_count"]), "STATUS": ("全量成功" if data["scores_sealed"] else "采样完成，评分未封存") if data["all_planned_successful"] else "有失败或缺口", "CONCLUSION": html.escape(assessment["conclusion"]), "EVIDENCE": evidence, "TABLE": condition_table(data["conditions"]), "TIME": fmt(data["observed_total_elapsed_s"]), "COST": fmt(data["known_cost_usd"] if data["cost_coverage_attempts"] else None, 6), "COVERAGE": str(data["cost_coverage_attempts"]), "PRICE_DATE": html.escape(str(prices.get("as_of") or "未知")), "PARENT": comparison, "DETAIL": "".join(detail), "PROMPT": markdown(context["prompt"]), "GOLD": html.escape(json.dumps(context["gold"], ensure_ascii=False, indent=2)), "HASHES": html.escape(json.dumps(p["input_hashes"], indent=2)), "RAW": raw, "LIMITS": limit_html, "PRICES": html.escape(json.dumps(prices, ensure_ascii=False, indent=2)), "DATA": payload}
     intro, old_evaluation, audit = evaluation_html(data, context)
-    values["TABLE"] = intro + values["TABLE"] + audit
+    values["TABLE"] = intro + values["TABLE"] + audit + agentic_html(data)
     values["PARENT"] += old_evaluation
     if "service_tiers" in p:
         values["TABLE"] += tier_comparison_html(data)
@@ -509,6 +739,7 @@ def validate_records(root):
     """Read-only transport, answer, usage and metric checks shared by exporters."""
     root = Path(root)
     p = check_inputs(root)
+    agentic_mode = execution_identity(p)[0] == "project-readonly"
     attempts, tids = all_attempts(root), set()
     schedule = {s["id"]: s for s in p["schedule"]}
     for r in attempts:
@@ -524,7 +755,43 @@ def validate_records(root):
         if r.get("thread_id"):
             require(r["thread_id"] not in tids, "Thread reused between attempts")
             tids.add(r["thread_id"])
-        if r.get("valid"):
+        if agentic_mode:
+            from agentic import TreeLedger
+            snapshot = r.get("agentic")
+            if snapshot is None:
+                require(not r.get("valid") and not r.get("usage") and not any(r.get(k) is not None for k in AGENTIC_METRICS),
+                        "Missing agentic ledger for reported work")
+                recalculated = metrics_for_protocol(p, None, r.get("elapsed_s"), answer=answer)
+            else:
+                require(isinstance(snapshot, dict) and snapshot.get("schema_version") == 1, "Malformed task-tree ledger")
+                ledger = TreeLedger.from_snapshot(snapshot)
+                require(digest(snapshot) == digest(ledger.snapshot()), "Task-tree ledger differs from event replay")
+                if (directory / "events.jsonl").is_file():
+                    events = [json.loads(line) for line in (directory / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+                    require(events == snapshot["events"], "Task-tree events differ from stored event ledger")
+                if (directory / "task-tree.json").is_file():
+                    require(read(directory / "task-tree.json") == snapshot, "Task-tree export differs from result")
+                require(snapshot["root_thread_id"] == r.get("thread_id"), "Task-tree root differs from result")
+                require(ledger.final_answer.replace("\r\n", "\n") == answer.replace("\r\n", "\n"), "Final answer differs from task-tree ledger")
+                descendant_ids = set(ledger.related_thread_ids) - {r.get("thread_id")}
+                require(not descendant_ids.intersection(tids), "Descendant thread reused between attempts")
+                tids.update(descendant_ids)
+                if r.get("valid"):
+                    e = r["effective"]
+                    require(r["status"] == "completed" and ledger.root_status == "completed" and ledger.tree_terminal
+                            and snapshot.get("discovery_complete") is True, "Valid answer has unfinished task tree")
+                    require(e["model"] == r["model"] and e["reasoningEffort"] == r["effort"] and e["serviceTier"] == tier,
+                            "Invalid effective settings/status")
+                    require(bool(answer.strip()) and not ledger.errors and not r.get("protocol_issues")
+                            and not r.get("protocol_violations"), "Invalid final answer/protocol")
+                    require((directory / "events.jsonl").is_file(), "Missing events for valid result")
+                recalculated = ledger.metrics(read(root / "prices.json"), p, r.get("elapsed_s"))
+                for key in (*AGENTIC_METRICS, *AGENTIC_FLAGS):
+                    actual, expected = r.get(key), recalculated.get(key)
+                    require((actual is expected) if expected is None or isinstance(expected, bool)
+                            else actual is not None and math.isclose(actual, expected, rel_tol=1e-8, abs_tol=1e-7),
+                            "Task-tree metric inconsistent: " + key)
+        elif r.get("valid"):
             e = r["effective"]
             require(r["status"] == "completed" and e["model"] == r["model"] and e["reasoningEffort"] == r["effort"] and e["serviceTier"] == tier and not r.get("tool_items"), "Invalid effective settings/status/tools")
             require(not usage_issues(r.get("usage")), "Invalid reported usage")
@@ -535,7 +802,8 @@ def validate_records(root):
             if ds:
                 require("".join(e["delta"] for e in ds).replace("\r\n", "\n") == answer.replace("\r\n", "\n"), "Stream differs from answer")
                 require(abs(ds[0]["t_s"]-r["first_delta_s"]) < 1e-4 and abs(ds[-1]["t_s"]-r["last_delta_s"]) < 1e-4, "Visible timing inconsistent")
-        recalculated = metrics_for_protocol(p, r.get("usage"), r.get("elapsed_s"), r.get("first_delta_s"), r.get("last_delta_s"), answer, price_for(read(root / "prices.json"), r["model"], tier))
+        if not agentic_mode:
+            recalculated = metrics_for_protocol(p, r.get("usage"), r.get("elapsed_s"), r.get("first_delta_s"), r.get("last_delta_s"), answer, price_for(read(root / "prices.json"), r["model"], tier))
         for k in metric_keys(p):
             a, b = r.get(k), recalculated[k]
             require(a is None and b is None or a is not None and b is not None and math.isclose(a, b, rel_tol=1e-8, abs_tol=1e-7), "Metric inconsistent: " + k)
@@ -580,15 +848,18 @@ def validate(root, partial=False):
 
 def archive(root):
     root = Path(root)
+    if execution_identity(check_inputs(root))[0] == "project-readonly":
+        capability_summary(root)
     files = []
-    names = ["protocol.json", "prices.json", "runtime.json", "preflight.json", "instruction-context.json", "preparation-seal.json", "progress.json", "assessment.json", "summary.json", "metrics.csv", "report.html", "validation.json", "ui-check.json", "parent-summary.json"]
+    names = ["protocol.json", "prices.json", "runtime.json", "preflight.json", "instruction-context.json", "preparation-seal.json", "progress.json", "assessment.json", "summary.json", "metrics.csv", "report.html", "validation.json", "ui-check.json", "parent-summary.json", "permission-probe.json", "permission-probe-seal.json"]
     files.extend(root / n for n in names if (root / n).is_file())
     files.extend(p for p in (root / "input").rglob("*") if p.is_file())
     if check_inputs(root).get("offline_regrade"):
         manifest = read(root / "evaluation/manifest.json")
         files.append(root / "evaluation/manifest.json")
         files.extend(inside(root, name) for name in manifest["files_sha256"] if name.startswith("evaluation/"))
-    files.extend(p for p in (root / "runs").glob("*/attempt-*/*") if p.name in ["answer.txt", "result.json", "events.jsonl"] and p.is_file())
+    files.extend(p for p in (root / "runs").glob("*/attempt-*/*") if p.name in ["answer.txt", "result.json", "events.jsonl", "task-tree.json"] and p.is_file())
+    files.extend(native_evidence_files(root))
     files.extend(root / "grading" / n for n in ["private-mapping.json", "scores.json", "seal.json"] if (root / "grading" / n).is_file())
     files.extend(p for p in (root / "grading/packet").rglob("*") if p.is_file() and p.name != "scores-template.json")
     # Retain superseded unsealed packets, including unfinished scorer notes and
@@ -598,7 +869,7 @@ def archive(root):
         files.extend(p for p in (previous / "packet").rglob("*") if p.is_file())
     for path in files:
         require(path.resolve().is_relative_to(root.resolve()), "Archive entry escapes run")
-        check_sensitive(path.read_text(encoding="utf-8-sig"))
+        check_artifact_sensitive(path, path.is_relative_to(root / "input/source-snapshot") or "scratch" in path.relative_to(root).parts)
     temp = root / "benchmark-results.zip.tmp"
     with zipfile.ZipFile(temp, "w", zipfile.ZIP_DEFLATED) as z:
         for path in files:

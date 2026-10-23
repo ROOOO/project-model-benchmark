@@ -1,6 +1,6 @@
 # 执行接口
 
-所有命令使用 `python -X utf8 <skill>/scripts/benchmark.py ...`。Python 3.11+；脚本不安装依赖、不修改 Codex 配置，复用当前登录和 provider。默认只在 `run` / `resume` 发起模型推理。
+所有命令使用 `python -X utf8 <skill>/scripts/benchmark.py ...`。Python 3.11+；脚本不安装依赖、不修改 Codex 全局配置，复用当前登录和 provider。只有显式 `smoke / run / resume` 发起模型推理。新建工程分析默认 `project-readonly`，必须准备 execution spec，接口与验收见[工程代理执行](agentic.md)。以下闭卷示例须显式传 `--execution-mode fixed-evidence`；新 Ultra 不支持闭卷模式。
 
 ## 工程与暂存区
 
@@ -76,10 +76,11 @@ case/
 ## 准备、预检、采样
 
 ```text
-benchmark.py prepare --case-dir <case> [--run-dir <new-directory>] [--prices <prices.json>]
-benchmark.py prepare --case-dir <case> --models gpt-6-sol --efforts xhigh max --repetitions 5
-benchmark.py prepare --case-dir <case> --models gpt-6.1-sol gpt-6-astra --efforts xhigh max ultra --service-tiers default fast --repetitions 5 --prices <tier-prices.json>
+benchmark.py prepare --case-dir <case> --execution-spec <spec.json> [--run-dir <new-directory>] [--prices <prices.json>]
+benchmark.py prepare --case-dir <case> --execution-mode fixed-evidence --models gpt-6-sol --efforts xhigh max --repetitions 5
+benchmark.py prepare --case-dir <case> --execution-spec <spec.json> --models gpt-6.1-sol gpt-6-astra --efforts xhigh ultra --service-tiers default fast --repetitions 5 --prices <tier-prices.json>
 benchmark.py preflight --run-dir <run> [--codex <explicit-executable>]
+benchmark.py smoke --run-dir <run> [--codex <explicit-executable>]
 benchmark.py run --run-dir <run> [--codex <explicit-executable>]
 benchmark.py resume --run-dir <run>
 benchmark.py resume --run-dir <run> --retry-failed
@@ -141,7 +142,7 @@ benchmark.py validate --run-dir <new-sibling-directory>
 
 重审目录的 `preflight / run / resume / retest` 均拒绝；需要付费原题复测时指定原采样目录。新报告为独立HTML/CSV/JSON/ZIP，V2导出含版本、权重、四维分数、逐项原文依据及错误/遗漏；V1导出保持原结构。不同评分版本单独展示，不合并排名。
 
-## 原题复测
+## 闭卷原题复测
 
 ```text
 benchmark.py retest --parent <previous-run> --efforts max [--prices <fresh-prices.json>]
@@ -149,7 +150,7 @@ benchmark.py preflight --run-dir <new-run>
 benchmark.py run --run-dir <new-run>
 ```
 
-`retest` 只准备新批次，沿用原题、摘录、指令和 gold，默认每组 5 次，可覆盖模型与档位。父批次须已评分并生成报告。价格快照须重新核对，不传时标未知。父批次统计单独嵌入新报告，不复制全部私有历史答案、不合并抽样；环境变化会提示。
+`retest` 仅接受 fixed-evidence 父批次，只准备新批次，沿用原题、摘录、指令和 gold，默认每组 5 次，可覆盖模型与档位。父批次须已评分并生成报告。价格快照须重新核对，不传时标未知。父批次统计单独嵌入新报告，不复制全部私有历史答案、不合并抽样；环境变化会提示。工程代理模式重测使用新 `prepare`、源码快照与独立工作区，见 [工程代理执行](agentic.md)。
 
 ## 已有批次离线比较
 

@@ -83,7 +83,7 @@ for (const c of cases) for (const effort of efforts) for (const sort of ['config
   vm.runInContext('renderCase()', ctx, { timeout: 10000 });
   combinations++;
   const groups = (c.conditions || []).filter(g => effort === 'all' || g.effort === effort);
-  for (const table of ['qualityTable tbody', 'performanceTable tbody', 'costTable tbody']) {
+  for (const table of ['qualityTable tbody', 'performanceTable tbody', 'costTable tbody', 'agenticTable tbody']) {
     eq(countRows(node('#' + table).innerHTML), groups.length, table + ' filter count');
   }
   eq(countRows(node('#crossCaseTable tbody').innerHTML), cases.reduce((sum, each) => sum +
@@ -96,7 +96,9 @@ for (const c of cases) for (const effort of efforts) for (const sort of ['config
   for (const [chart, key, center] of [
     ['elapsedChart', 'elapsed_s', 'median'], ['ttftChart', 'ttft_visible_s', 'median'],
     ['tpsChart', 'visible_decode_tps', 'median'], ['outputChart', 'output_tokens', 'median'],
-    ['costChart', 'estimated_api_usd', 'mean']
+    ['costChart', 'estimated_api_usd', 'mean'], ['answerReadyChart', 'answer_ready_s', 'median'],
+    ['finalTtftChart', 'final_ttft_s', 'median'], ['progressChart', 'first_progress_s', 'median'],
+    ['rootThroughputChart', 'root_output_e2e_tps', 'median'], ['agentCountChart', 'delegation_count', 'median']
   ]) {
     const markup = node('#' + chart).innerHTML;
     const available = groups.filter(g => finite(g.statistics?.[key]?.[center]));

@@ -11,12 +11,13 @@ from core import BenchmarkError, EFFORTS, MODELS, check_inputs, home, prepare, r
 from evaluation import regrade
 from comparison import compare
 from reporting import archive, blind, build_report, seal, validate
-from runtime import Server, execute
+from runtime import Server, execute, capability_smoke
 
 
 def retest(parent, output=None, models=None, efforts=None, repetitions=5, prices=None, service_tiers=None):
     parent = Path(parent).resolve()
     p = require_sampling_allowed(parent)
+    require(not p.get("execution_profile"), "Project-readonly retests require a new prepare with a fresh source workspace and execution specification")
     require((parent / "summary.json").exists() and (parent / "grading/seal.json").exists(), "Finish scoring/reporting the parent batch before retesting")
     validate(parent)
     tiers = service_tiers if service_tiers is not None else p.get("service_tiers")
@@ -49,6 +50,12 @@ def parser():
     comparison.add_argument("--output", required=True)
     comparison.add_argument("--models", nargs="+")
     comparison.add_argument("--assessment", help="JSON with conclusion, evidence and limitations; omitted uses neutral notes")
+    adoption = sub.add_parser("adopt-smoke", help="Reuse verified capability checks across identical study environments; no inference")
+    adoption.add_argument("--run-dir", required=True)
+    adoption.add_argument("--source", required=True)
+    recovery = sub.add_parser("recover-smoke", help="Replay an archived capability check into a fresh revision; no inference")
+    recovery.add_argument("--run-dir", required=True)
+    recovery.add_argument("--source", required=True)
     for command in ["prepare", "retest"]:
         q = sub.add_parser(command, help="Prepare a new batch; never starts inference")
         q.add_argument("--case-dir" if command == "prepare" else "--parent", required=True)
@@ -58,13 +65,18 @@ def parser():
         q.add_argument("--repetitions", type=int, default=5)
         q.add_argument("--prices")
         q.add_argument("--service-tiers", nargs="+", choices=["default", "fast", "priority"], help="Speed modes; Fast is frozen as priority. Prepare defaults to Standard; retest inherits the parent.")
-    for command in ["preflight", "run", "resume", "blind", "seal", "report", "validate"]:
+        if command == "prepare":
+            q.add_argument("--execution-mode", choices=["project-readonly", "fixed-evidence"], default="project-readonly")
+            q.add_argument("--execution-spec", help="JSON source_roots specification for a frozen read-only project workspace")
+    for command in ["preflight", "smoke", "run", "resume", "blind", "seal", "report", "validate"]:
         q = sub.add_parser(command)
         q.add_argument("--run-dir", required=True)
-        if command in ["preflight", "run", "resume"]:
+        if command in ["preflight", "smoke", "run", "resume"]:
             q.add_argument("--codex")
         if command == "resume":
             q.add_argument("--retry-failed", action="store_true")
+        if command == "smoke":
+            q.add_argument("--continue", dest="continue_existing", action="store_true", help="Run only untouched capability positions after verified offline recovery; never retry failed attempts")
         if command == "seal":
             q.add_argument("--scores", required=True)
         if command == "blind":
@@ -86,9 +98,19 @@ def main(argv=None):
         value = regrade(args.run_dir, args.rubric, args.output)
     elif args.command == "compare":
         value = compare(args.run_dirs, args.output, args.models, args.assessment)
+    elif args.command == "adopt-smoke":
+        from agentic_runtime import adopt_capability
+        value = adopt_capability(args.run_dir, args.source)
+    elif args.command == "recover-smoke":
+        from agentic_runtime import recover_capability
+        value = recover_capability(args.run_dir, args.source)
     elif args.command in ["prepare", "retest"]:
         if args.command == "prepare":
-            root = prepare(args.case_dir, args.run_dir, args.models, args.efforts, args.repetitions, args.prices, service_tiers=args.service_tiers)
+            require(args.execution_mode != "project-readonly" or args.execution_spec, "Project-readonly preparation requires --execution-spec with source_roots")
+            require(args.execution_mode != "fixed-evidence" or not args.execution_spec, "Fixed-evidence does not accept an execution specification")
+            require(args.execution_mode != "fixed-evidence" or "ultra" not in args.efforts, "New Ultra measurements require native tools/delegation; use project-readonly")
+            root = prepare(args.case_dir, args.run_dir, args.models, args.efforts, args.repetitions, args.prices, service_tiers=args.service_tiers,
+                           execution_profile=read(args.execution_spec) if args.execution_spec else None)
         else:
             root = retest(args.parent, args.run_dir, args.models, args.efforts, args.repetitions, args.prices, args.service_tiers)
         p = check_inputs(root)
@@ -102,6 +124,8 @@ def main(argv=None):
                 value = server.preflight(p)
             finally:
                 server.close()
+        elif args.command == "smoke":
+            value = capability_smoke(root, args.codex, continue_existing=args.continue_existing)
         elif args.command in ["run", "resume"]:
             execute(root, args.codex, args.command == "resume", getattr(args, "retry_failed", False))
             value = {"sampling_finished": True, "run_dir": str(root), "next": "blind"}

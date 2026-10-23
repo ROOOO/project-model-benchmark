@@ -11,14 +11,14 @@ import zipfile
 from core import (METRICS, check_inputs, check_sensitive, digest,
                   distribution, inside, now, numeric, read, require, scoring_gold,
                   scoring_weights, sha, write)
-from reporting import idle, summarize, validate_records
+from reporting import AGENTIC_FLAGS, AGENTIC_METRICS, check_artifact_sensitive, execution_identity, idle, native_evidence_files, runtime_fingerprint, summarize, validate_records
 
 
 DIMENSIONS = ("accuracy", "coverage", "readability", "insight")
 CANONICAL_METRICS = tuple(dict.fromkeys(
     "estimated_api_usd" if x == "estimated_standard_api_usd" else x for x in METRICS))
-STAT_FIELDS = CANONICAL_METRICS + DIMENSIONS + ("quality",)
-IDENTITY_FIELDS = ("case", "batch", "origin_batch_id", "model", "effort", "service_tier", "speed_mode")
+STAT_FIELDS = tuple(dict.fromkeys(CANONICAL_METRICS + AGENTIC_METRICS)) + DIMENSIONS + ("quality",)
+IDENTITY_FIELDS = ("case", "batch", "origin_batch_id", "execution_mode", "execution_profile_id", "model", "effort", "service_tier", "speed_mode")
 PAIR_FIELDS = ("case", "model", "effort", "kind", "standard_condition", "fast_condition",
                "standard_batch", "fast_batch", "standard_valid", "fast_valid",
                "standard_elapsed_median_s", "fast_elapsed_median_s", "elapsed_reduction_pct",
@@ -26,6 +26,7 @@ PAIR_FIELDS = ("case", "model", "effort", "kind", "standard_condition", "fast_co
 DEFAULT_LIMITATIONS = [
     "只比较已封存答案，不新增模型采样；单题及小样本差异不能直接推广到其他任务。",
     "质量按题目和评分细则分别展示，不合并不同题目或细则的分数；旧分值保留原尺度，缺失维度为未知。",
+    "执行模式、工具策略或源码指纹不同的批次分别展示，禁止将封闭材料与工程代理结果直接合并或配对。",
     "评分属于 AI 辅助评阅；事后重评与先前身份暴露等限制沿用各来源记录。",
     "耗时与首字等待、TPS 均为客户端观测，受排队、网络、思考、输出及缓冲影响。",
     "Fast 收益比较组中位数，不是逐次配对实验；跨批次仅为历史观察，环境与价格可能不同。",
@@ -149,7 +150,9 @@ def build_data(run_dirs, models=None, assessment=None):
         # Group on the complete frozen scoring document: identical labels/weights
         # alone do not establish compatible criteria or reference facts.
         rubric_hash = digest(gold)
-        case_key = digest({"case_id": protocol["case_id"], "rubric_sha256": rubric_hash})
+        execution_mode, execution_id = execution_identity(protocol, runtime_fingerprint(root))
+        case_key = digest({"case_id": protocol["case_id"], "rubric_sha256": rubric_hash,
+                           "execution_profile_id": execution_id})
         original_protocol = read(root / "evaluation/source-protocol.json") if protocol.get("offline_regrade") else protocol
         origin = digest(original_protocol)
         source_id = _source_id(source_index, root)
@@ -171,9 +174,10 @@ def build_data(run_dirs, models=None, assessment=None):
             require(all(row.get(k) is None or numeric(row[k]) for k in CANONICAL_METRICS if k != "estimated_api_usd"),
                     "Invalid source metric")
             archive_answer = f"answers/{source_id}/{Path(relative_result).parent.as_posix()}/answer.txt"
-            item = {k: row.get(k) for k in (*CANONICAL_METRICS, *DIMENSIONS, "quality", "slot_id", "attempt",
+            item = {k: row.get(k) for k in (*CANONICAL_METRICS, *AGENTIC_METRICS, *AGENTIC_FLAGS, *DIMENSIONS, "quality", "slot_id", "attempt",
                                          "repetition", "status", "valid", "selected", "anonymous_id", "critical_errors", "errors", "omissions")}
             item.update(case=case_key, batch=root.name, source_id=source_id, origin_batch_id=origin,
+                        execution_mode=execution_mode, execution_profile_id=execution_id,
                         model=row["model"], effort=row["effort"], service_tier=tier,
                         speed_mode="Fast" if tier == "priority" else "Standard",
                         estimated_api_usd=canonical_cost(row), attempt_identity=identity,
@@ -196,6 +200,7 @@ def build_data(run_dirs, models=None, assessment=None):
             continue
         source = {"id": source_id, "batch": root.name, "label": root.name, "origin_batch_id": origin,
                   "case": case_key, "url": (root / "report.html").as_uri(),
+                  "execution_mode": execution_mode, "execution_profile_id": execution_id,
                   "summary_url": (root / "summary.json").as_uri(), "scoring_version": gold.get("scoring_version", 1),
                   "rubric_sha256": rubric_hash, "weights": weights, "evaluation": expected.get("evaluation"),
                   "protocol_sha256": sha(root / "protocol.json"), "scores_sha256": sha(root / "grading/scores.json"),
@@ -204,10 +209,13 @@ def build_data(run_dirs, models=None, assessment=None):
                                        for s in protocol["schedule"]),
                   "valid_answers": sum(r["selected"] and r["valid"] and r["status"] == "completed" for r in source_rows),
                   "attempts": len(source_rows)}
+        if expected.get("capability_verification") is not None:
+            source["capability_verification"] = expected["capability_verification"]
         sources.append(source)
         case = cases.setdefault(case_key, {"id": case_key, "case_id": protocol["case_id"],
                                             "label": protocol["title"], "title": protocol["title"],
                                             "rubric_sha256": rubric_hash, "scoring_version": gold.get("scoring_version", 1),
+                                            "execution_mode": execution_mode, "execution_profile_id": execution_id,
                                             "weights": weights, "dimension_maxima": weights,
                                             "conditions": [], "sources": []})
         case["sources"].append(source)
@@ -222,6 +230,7 @@ def build_data(run_dirs, models=None, assessment=None):
             statistics = {k: distribution([r.get(k) for r in good]) for k in STAT_FIELDS}
             item = {"id": digest({"source": source_id, "model": condition["model"], "effort": condition["effort"], "tier": tier}),
                     "case": case_key, "batch": root.name, "origin_batch_id": origin,
+                    "execution_mode": execution_mode, "execution_profile_id": execution_id,
                     "model": condition["model"], "effort": condition["effort"], "service_tier": tier,
                     "speed_mode": "Fast" if tier == "priority" else "Standard", "planned": condition["planned"],
                     "settled": sum(r["selected"] for r in condition_rows), "valid_completed": len(good),
@@ -235,6 +244,13 @@ def build_data(run_dirs, models=None, assessment=None):
                     "ceiling_counts": {k: sum(r.get(k) == maximum for r in good) for k, maximum in weights.items()},
                     "known_cost_usd": sum(r["estimated_api_usd"] for r in condition_rows if r["estimated_api_usd"] is not None),
                     "cost_coverage_attempts": sum(r["estimated_api_usd"] is not None for r in condition_rows)}
+            observed_delegation = [r for r in good if isinstance(r.get("delegation_occurred"), bool)]
+            item.update(delegation_observed_answers=len(observed_delegation),
+                        delegated_answers=sum(r["delegation_occurred"] for r in observed_delegation),
+                        delegation_rate=sum(r["delegation_occurred"] for r in observed_delegation) / len(observed_delegation) if observed_delegation else None,
+                        accounting_complete_attempts=sum(r.get("accounting_complete") is True for r in condition_rows),
+                        known_observed_cost_usd=sum(r["tree_observed_api_usd"] for r in condition_rows if r.get("tree_observed_api_usd") is not None),
+                        observed_cost_coverage_attempts=sum(r.get("tree_observed_api_usd") is not None for r in condition_rows))
             require(item["valid_completed"] == condition["valid_completed"], "Condition valid count differs from sealed summary")
             case["conditions"].append(item)
     require(bool(rows), "No attempts match the selected models")
@@ -251,7 +267,7 @@ def build_data(run_dirs, models=None, assessment=None):
               "paired_speed_observations": pairs, "pairing_notes": pairing_notes,
               "assessment": assessment_value(assessment), "limitations": DEFAULT_LIMITATIONS,
               "definitions": {"quality": "各题各评分细则独立展示，不汇总跨题质量或费用加权总分。",
-                              "elapsed_s": "从 turn/start 到 turn/completed 的客户端总耗时，单位秒；图表使用中位数、范围及样本点。",
+                              "elapsed_s": "客户端完成耗时，单位秒；旧模式到根 turn 完成，工程代理模式到任务树终态；不同执行模式不合并。",
                               "ttft_visible_s": "首个非空可见 delta 的客户端等待时间，单位秒。",
                               "visible_decode_tps": "可见输出 token / 首末非空可见 delta 间隔；受客户端缓冲影响。",
                               "estimated_api_usd": "已封存价格快照估算；兼容旧 estimated_standard_api_usd，未知不计为零。",
@@ -259,6 +275,17 @@ def build_data(run_dirs, models=None, assessment=None):
                               "omission_answers": "原评分记录中的遗漏标记；不等于正式覆盖度扣分答案数。",
                               "fast_observations": "同批优先；跨批仅在一对候选唯一时显示历史观察；不逐次配对。"},
               "grading_details": details}
+    if any(c["execution_mode"] == "project-readonly" for c in values):
+        result["definitions"].update(
+            answer_ready_s="根最终答案交付完成；可能早于所有子任务结束。",
+            root_turn_completed_s="根 turn 结束通知；与最终答案消息交付、全树终态分别记录。",
+            workflow_elapsed_s="根请求发出至所有已启动子孙工作终态；idle 线程不必关闭。",
+            first_progress_s="首次可见根进度或正文；与最终正文首字分别展示。",
+            final_ttft_s="根 final 消息首次非空 delta 等待。",
+            delegation_count="观测到的唯一子孙线程数；零委派是有效观测。",
+            tree_estimated_api_usd="收齐响应与价格后按实际模型及速度档汇总的全树估算费用。",
+            tree_observed_api_usd="已知响应的可计价部分，包含失败尝试；不是完整总费用。",
+            visible_decode_tps="工程代理模式仅在根输出可归属时提供；不可用全树输出除根答案流时长。")
     check_sensitive(json.dumps(result, ensure_ascii=False, allow_nan=False))
     return result
 
@@ -276,6 +303,9 @@ def export_tables(data):
     for case in data["cases"]:
         for cell in case["conditions"]:
             row = {k: cell.get(k) for k in ("id", *IDENTITY_FIELDS, "planned", "settled", "valid_completed", "attempts", "failed_attempts")}
+            row.update({k: cell.get(k) for k in ("delegation_observed_answers", "delegated_answers", "delegation_rate",
+                                                "accounting_complete_attempts", "known_cost_usd", "cost_coverage_attempts",
+                                                "known_observed_cost_usd", "observed_cost_coverage_attempts")})
             row.update(scoring_version=case["scoring_version"], rubric_sha256=case["rubric_sha256"])
             row.update({k + "_max": case["weights"].get(k) for k in DIMENSIONS})
             for key, statistics in cell["statistics"].items():
@@ -284,6 +314,7 @@ def export_tables(data):
     condition_fields = list(dict.fromkeys(k for row in conditions for k in row))
     sample_fields = [*IDENTITY_FIELDS, "source_id", "slot_id", "attempt", "repetition", "status", "valid", "selected",
                      "anonymous_id", "attempt_identity", *DIMENSIONS, "quality", *CANONICAL_METRICS,
+                     *AGENTIC_METRICS, *AGENTIC_FLAGS,
                      "critical_errors", "errors", "omissions", "actual_gateway_charge", "remote_completion",
                      "answer_sha256", "result_sha256", "answer_link", "source_answer_url"]
     return {"conditions.csv": _csv(conditions, condition_fields),
@@ -315,11 +346,12 @@ def compare(run_dirs, output, models=None, assessment=None):
         source_files = ["protocol.json", "preparation-seal.json", "prices.json", "summary.json",
                         "grading/scores.json", "grading/seal.json", "grading/private-mapping.json"]
         source_files += [p.relative_to(root).as_posix() for p in (root / "input").rglob("*") if p.is_file()]
-        source_files += [name for name in ("evaluation/rubric.json", "evaluation/manifest.json", "evaluation/source-protocol.json")
+        source_files += [name for name in ("evaluation/rubric.json", "evaluation/manifest.json", "evaluation/source-protocol.json", "permission-probe.json", "permission-probe-seal.json", "runtime.json", "preflight.json", "instruction-context.json")
                          if (root / name).is_file()]
+        source_files += [p.relative_to(root).as_posix() for p in native_evidence_files(root)]
         for name in source_files:
             original = inside(root, name)
-            check_sensitive(original.read_text(encoding="utf-8-sig"))
+            check_artifact_sensitive(original, original.is_relative_to(root / "input/source-snapshot") or "scratch" in original.relative_to(root).parts)
             destination = inside(output, f"sources/{source['id']}/{name}")
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(original, destination)
@@ -336,6 +368,14 @@ def compare(run_dirs, output, models=None, assessment=None):
         record_destination = destination.with_name("result.json")
         shutil.copyfile(record_source, record_destination)
         require(sha(record_destination) == row["result_sha256"], "Copied attempt record differs from source")
+        for name in ("events.jsonl", "task-tree.json"):
+            companion = record_source.with_name(name)
+            if companion.is_file() and row["execution_mode"] == "project-readonly":
+                check_artifact_sensitive(companion)
+                target = record_destination.with_name(name)
+                shutil.copyfile(companion, target)
+                require(sha(target) == before[str(source_by_id[row["source_id"]])][companion.relative_to(source_by_id[row["source_id"]]).as_posix()],
+                        "Copied task-tree ledger differs from source")
     payload = json.dumps(data, ensure_ascii=False, allow_nan=False).replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
     (output / "report.html").write_text(template.replace("__COMPARISON_DATA__", payload), encoding="utf-8")
     after = {str(p): fingerprint(p) for p in roots}
