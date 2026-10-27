@@ -87,7 +87,8 @@ class AgenticReportingTests(unittest.TestCase):
                 event("item/started", time=5, item={"type": "agentMessage", "id": "final", "phase": "final_answer"})
                 event("item/agentMessage/delta", time=5.1, itemId="final", delta=answer)
                 event("item/completed", time=5.5, item={"type": "agentMessage", "id": "final", "phase": "final_answer", "text": answer})
-            event("turn/completed", time=6, turn={"id": turn, "status": "failed" if failed else "completed"})
+            event("turn/completed", time=6, turn={"id": turn, "status": "failed" if failed else "completed", "items": [
+                {"type": "agentMessage", "id": "final", "phase": "final_answer", "text": answer}] if answer else []})
             ledger.reconcile_thread({"id": tid, "status": {"type": "idle"}}, 8)
             ledger.mark_discovery_complete(9)
             (directory / "answer.txt").write_text(answer, encoding="utf-8")

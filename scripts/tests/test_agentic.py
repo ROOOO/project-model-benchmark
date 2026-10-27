@@ -51,7 +51,9 @@ class TreeLedgerTests(unittest.TestCase):
         self.event(ledger, "item/completed", time=time+.5, item={"type": "agentMessage", "id": "final", "phase": phase, "text": text})
 
     def complete_root(self, ledger, time=6):
-        self.event(ledger, "turn/completed", time=time, turn={"id": "root-turn", "status": "completed"})
+        items = [{"type": "agentMessage", "id": entry["id"], "phase": entry["phase"], "text": entry["text"]}
+                 for entry in ledger.messages.values() if entry["turn_id"] == "root-turn" and entry["completed"]]
+        self.event(ledger, "turn/completed", time=time, turn={"id": "root-turn", "status": "completed", "items": items})
 
     def reconcile(self, ledger, *tids, time=9):
         for tid in tids or ledger.related_thread_ids:
@@ -384,8 +386,168 @@ class TreeLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         self.event(ledger, "item/agentMessage/delta", itemId="final", delta="答案", time=1)
         self.event(ledger, "item/completed", item={"type": "agentMessage", "id": "final", "phase": "final_answer", "text": "答案"}, time=2)
+        self.assertEqual(ledger.final_answer, "")
+        self.complete_root(ledger, time=2.5)
         self.assertEqual(ledger.final_answer, "答案")
         self.assertEqual(ledger.metrics(PRICES, PROTOCOL, 3)["final_ttft_s"], 1)
+
+    def test_authoritative_final_excludes_abandoned_retry_deltas(self):
+        ledger = self.ledger()
+        for item_id, text, time in (("retry-1", "被中断的正文", 1), ("retry-2", "半张表格|", 2)):
+            self.event(ledger, "item/started", time=time, item={"type": "agentMessage", "id": item_id, "phase": "final_answer"})
+            self.event(ledger, "item/agentMessage/delta", time=time+.1, itemId=item_id, delta=text)
+            self.event(ledger, "error", time=time+.2, willRetry=True)
+        self.response(ledger)
+        self.final(ledger)
+        self.complete_root(ledger)
+        self.reconcile(ledger)
+        self.assertEqual(ledger.final_answer, "答案")
+        self.assertEqual([entry["id"] for entry in ledger.final_messages], ["final"])
+        metrics = ledger.metrics(PRICES, PROTOCOL, 9)
+        self.assertEqual(metrics["final_ttft_s"], 5.1)
+        self.assertEqual(metrics["answer_ready_s"], 5.5)
+        self.assertEqual(metrics["tree_output_tokens"], 20)
+        self.assertEqual(digest(ledger.snapshot()), digest(TreeLedger.from_snapshot(ledger.snapshot()).snapshot()))
+
+    def test_authoritative_final_does_not_join_duplicate_completed_item(self):
+        ledger = self.ledger()
+        self.event(ledger, "item/completed", time=2, item={"type": "agentMessage", "id": "retired", "phase": "final_answer", "text": "答案"})
+        self.final(ledger)
+        self.event(ledger, "turn/completed", time=6, turn={"id": "root-turn", "status": "completed", "items": [
+            {"type": "agentMessage", "id": "final", "phase": "final_answer", "text": "答案"}]})
+        self.assertEqual(ledger.final_answer, "答案")
+        self.assertEqual(len(ledger.final_messages), 1)
+
+    def test_empty_final_and_late_standalone_items_do_not_change_authoritative_answer(self):
+        ledger = self.completed()
+        before = ledger.metrics(PRICES, PROTOCOL, 9)
+        self.event(ledger, "item/completed", time=10, item={"type": "agentMessage", "id": "empty", "phase": "final_answer", "text": ""})
+        self.event(ledger, "item/completed", time=11, item={"type": "agentMessage", "id": "final", "phase": "final_answer", "text": "迟到的另一版本"})
+        self.assertEqual(ledger.final_answer, "答案")
+        self.assertEqual(ledger.answer_ready_s, 5.5)
+        self.assertEqual(ledger.metrics(PRICES, PROTOCOL, 9)["final_ttft_s"], before["final_ttft_s"])
+        self.assertEqual(digest(ledger.snapshot()), digest(TreeLedger.from_snapshot(ledger.snapshot()).snapshot()))
+
+    def test_authoritative_final_follows_turn_item_order_and_ignores_empty_items(self):
+        ledger = self.ledger()
+        for item_id, text in (("a", "第一部分"), ("b", "第二部分"), ("empty", "  ")):
+            self.event(ledger, "item/completed", time=2, item={"type": "agentMessage", "id": item_id, "phase": "final_answer", "text": text})
+        self.event(ledger, "turn/completed", time=3, turn={"id": "root-turn", "status": "completed", "items": [
+            {"type": "agentMessage", "id": "b", "phase": "final_answer", "text": "第二部分"},
+            {"type": "agentMessage", "id": "empty", "phase": "final_answer", "text": "  "},
+            {"type": "agentMessage", "id": "a", "phase": "final_answer", "text": "第一部分"}]})
+        self.assertEqual(ledger.final_answer, "第二部分\n\n第一部分")
+
+    def test_missing_authoritative_final_is_not_guessed_from_completed_item(self):
+        ledger = self.ledger()
+        self.final(ledger)
+        self.event(ledger, "turn/completed", time=6, turn={"id": "root-turn", "status": "completed"})
+        self.assertEqual(ledger.final_answer, "")
+        self.assertIsNone(ledger.answer_ready_s)
+        self.assertIsNone(ledger.metrics(PRICES, PROTOCOL, 9)["final_ttft_s"])
+        self.assertIn("Missing authoritative root final-answer completion", ledger.accounting_issues())
+        self.complete_root(ledger, time=7)
+        self.assertEqual(ledger.final_answer, "答案")
+        self.assertNotIn("Missing authoritative root final-answer completion", ledger.accounting_issues())
+
+    def test_discarded_stream_mismatch_does_not_override_completed_turn_final(self):
+        ledger = self.ledger()
+        self.event(ledger, "item/agentMessage/delta", time=1, itemId="retired", delta="旧流")
+        self.event(ledger, "item/completed", time=2, item={"type": "agentMessage", "id": "retired", "phase": "final_answer", "text": "被放弃的重试"})
+        self.final(ledger)
+        self.event(ledger, "turn/completed", time=6, turn={"id": "root-turn", "status": "completed", "items": [
+            {"type": "agentMessage", "id": "final", "phase": "final_answer", "text": "答案"}]})
+        self.assertEqual(ledger.final_answer, "答案")
+        self.assertEqual(ledger.errors, [])
+
+    def test_authoritative_final_stream_mismatch_is_still_rejected(self):
+        ledger = self.ledger()
+        self.event(ledger, "item/agentMessage/delta", time=1, itemId="final", delta="流中的答案")
+        self.event(ledger, "turn/completed", time=2, turn={"id": "root-turn", "status": "completed", "items": [
+            {"type": "agentMessage", "id": "final", "phase": "final_answer", "text": "不同的完成答案"}]})
+        self.assertIn("Final answer stream disagrees with completed message", ledger.errors)
+
+    def test_legacy_snapshot_keeps_original_policy_unless_repair_is_explicit(self):
+        ledger = TreeLedger("root", "root-turn", {}, final_answer_policy="legacy")
+        self.event(ledger, "item/started", time=1, item={"type": "agentMessage", "id": "retired", "phase": "final_answer"})
+        self.event(ledger, "item/agentMessage/delta", time=1.1, itemId="retired", delta="中断文本")
+        self.final(ledger)
+        self.event(ledger, "turn/completed", time=6, turn={"id": "root-turn", "status": "completed", "items": [
+            {"type": "agentMessage", "id": "final", "phase": "final_answer", "text": "答案"}]})
+        original = ledger.snapshot()
+        self.assertNotIn("final_answer_policy", original)
+        self.assertEqual(ledger.final_answer, "中断文本\n\n答案")
+        self.assertEqual(TreeLedger.from_snapshot(original).snapshot(), original)
+        repaired = TreeLedger.from_snapshot(original, final_answer_policy="turn-completed-v1")
+        self.assertEqual(repaired.final_answer, "答案")
+        self.assertEqual(repaired.snapshot()["final_answer_policy"], "turn-completed-v1")
+        self.assertEqual(repaired.events, original["events"])
+
+    def test_late_middle_turn_completion_does_not_displace_newer_active_turn(self):
+        observations = [
+            ("turn/started", {"turn": {"id": "latest", "status": "inProgress"}}),
+            ("item/agentMessage/delta", {"itemId": "latest-final", "delta": "尚未完成"}),
+            ("rawResponse/completed", {"responseId": "latest-response", "usage": usage()}),
+        ]
+        for method, params in observations:
+            with self.subTest(first_latest_event=method):
+                ledger = self.ledger()
+                self.final(ledger)
+                self.complete_root(ledger, time=10)
+                self.event(ledger, method, turn_id="latest", time=30, **params)
+                self.event(ledger, "turn/completed", turn_id="middle", time=20,
+                           turn={"id": "middle", "status": "completed", "items": [
+                               {"type": "agentMessage", "id": "middle-final", "phase": "final_answer", "text": "旧根turn答案"}]})
+                self.assertEqual(ledger.root_turn_order, ["root-turn", "middle", "latest"])
+                self.assertEqual(ledger.root_status, "inProgress")
+                self.assertEqual(ledger.final_answer, "")
+                self.assertIsNone(ledger.answer_ready_s)
+                self.assertIsNone(ledger.root_turn_completed_s)
+                self.assertEqual(digest(ledger.snapshot()), digest(TreeLedger.from_snapshot(ledger.snapshot()).snapshot()))
+
+    def test_post_terminal_observations_do_not_move_queued_followup_into_history(self):
+        observations = [
+            ("item/agentMessage/delta", {"itemId": "orphan", "delta": "迟到文本"}),
+            ("rawResponse/completed", {"responseId": "late-response", "usage": usage()}),
+            ("turn/completed", {"turn": {"id": "root-turn", "status": "completed"}}),
+            ("reconcile", {}),
+        ]
+        for method, params in observations:
+            with self.subTest(late_old_observation=method):
+                ledger = self.ledger()
+                self.final(ledger)
+                self.complete_root(ledger, time=10)
+                if method == "reconcile":
+                    ledger.reconcile_thread({"id": "root", "status": "idle"}, 100)
+                else:
+                    self.event(ledger, method, time=100, **params)
+                self.event(ledger, "turn/started", turn_id="latest", time=50,
+                           turn={"id": "latest", "status": "inProgress"})
+                self.assertEqual(ledger.root_turn_order, ["root-turn", "latest"])
+                self.assertEqual(ledger.final_answer, "")
+                self.event(ledger, "turn/completed", turn_id="latest", time=70,
+                           turn={"id": "latest", "status": "completed", "items": [
+                               {"type": "agentMessage", "id": "latest-final", "phase": "final_answer", "text": "新根turn答案"}]})
+                self.assertEqual(ledger.root_status, "completed")
+                self.assertEqual(ledger.final_answer, "新根turn答案")
+                self.assertEqual(digest(ledger.snapshot()), digest(TreeLedger.from_snapshot(ledger.snapshot()).snapshot()))
+
+    def test_duplicate_completion_without_items_cannot_clear_confirmed_final(self):
+        ledger = self.completed()
+        self.event(ledger, "turn/completed", time=10, turn={"id": "root-turn", "status": "completed"})
+        self.assertEqual(ledger.final_answer, "答案")
+        self.assertEqual(ledger.answer_ready_s, 5.5)
+        self.assertEqual(ledger.errors, [])
+
+    def test_conflicting_terminal_finals_fail_closed_at_different_observation_times(self):
+        for time in (4, 10):
+            with self.subTest(conflicting_time=time):
+                ledger = self.completed()
+                self.event(ledger, "turn/completed", time=time, turn={"id": "root-turn", "status": "completed", "items": [
+                    {"type": "agentMessage", "id": "other-final", "phase": "final_answer", "text": "冲突的完成答案"}]})
+                self.assertEqual(ledger.final_answer, "答案")
+                self.assertIn("Conflicting authoritative final completion", ledger.errors)
+                self.assertFalse(ledger.accounting_complete)
 
     def test_raw_reasoning_errors_metadata_and_commands_are_not_archived(self):
         ledger = self.completed()
@@ -471,7 +633,8 @@ class TreeLedgerTests(unittest.TestCase):
         self.event(ledger, "item/started", "root", "root-followup", time=12, item={"type": "agentMessage", "id": "final-2", "phase": "final_answer"})
         self.event(ledger, "item/agentMessage/delta", "root", "root-followup", time=12.1, itemId="final-2", delta="复核后的答案")
         self.event(ledger, "item/completed", "root", "root-followup", time=13, item={"type": "agentMessage", "id": "final-2", "phase": "final_answer", "text": "复核后的答案"})
-        self.event(ledger, "turn/completed", "root", "root-followup", time=14, turn={"id": "root-followup", "status": "completed"})
+        self.event(ledger, "turn/completed", "root", "root-followup", time=14, turn={"id": "root-followup", "status": "completed", "items": [
+            {"type": "agentMessage", "id": "final-2", "phase": "final_answer", "text": "复核后的答案"}]})
         self.reconcile(ledger, time=15)
         result = ledger.metrics(PRICES, PROTOCOL, 15)
         self.assertTrue(ledger.root_completed)

@@ -45,6 +45,7 @@ def parser():
     revision.add_argument("--run-dir", required=True)
     revision.add_argument("--rubric", required=True)
     revision.add_argument("--output", required=True)
+    revision.add_argument("--repair-final-answers", action="store_true", help="Re-extract canonical completed finals from archived native events; no model calls")
     comparison = sub.add_parser("compare", help="Create a separate offline comparison from sealed runs; never starts inference")
     comparison.add_argument("--run-dirs", nargs="+", required=True)
     comparison.add_argument("--output", required=True)
@@ -95,7 +96,7 @@ def main(argv=None):
     elif args.command == "history":
         value = [{k: p.get(k) for k in ["title", "project", "case_id", "created_at"]} for f in sorted(Path(args.root).glob("*/protocol.json")) if (p := read(f))]
     elif args.command == "regrade":
-        value = regrade(args.run_dir, args.rubric, args.output)
+        value = regrade(args.run_dir, args.rubric, args.output, repair_final_answers=args.repair_final_answers)
     elif args.command == "compare":
         value = compare(args.run_dirs, args.output, args.models, args.assessment)
     elif args.command == "adopt-smoke":

@@ -40,7 +40,8 @@ def completed_events(*, child=False, explicit_phase=True):
                event("item/started", item={"type": "agentMessage", "id": "answer", **({"phase": "final_answer"} if explicit_phase else {})}),
                event("item/agentMessage/delta", itemId="answer", delta="None使用默认值，空串保留。"),
                event("item/completed", item={"type": "agentMessage", "id": "answer", "text": "None使用默认值，空串保留。", **({"phase": "final_answer"} if explicit_phase else {})}),
-               event("turn/completed", turn={"id": "root-turn", "status": "completed"})]
+               event("turn/completed", turn={"id": "root-turn", "status": "completed", "items": [
+                   {"type": "agentMessage", "id": "answer", "text": "None使用默认值，空串保留。", **({"phase": "final_answer"} if explicit_phase else {})}]})]
     if child:
         result += [event("rawResponse/completed", "child", "child-turn", responseId="child-response", usage=usage(80, 10)),
                    event("turn/completed", "child", "child-turn", turn={"id": "child-turn", "status": "completed"})]
@@ -235,7 +236,7 @@ class AgenticRuntimeTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertIn("No explicit root final-answer phase was observed", result["protocol_issues"])
 
-    def test_interruption_keeps_partial_answer_usage_and_inflight(self):
+    def test_interruption_keeps_partial_stream_for_audit_without_final_answer(self):
         messages = completed_events()[:-1]
         result, server = self.run_fake(messages)
         self.assertFalse(result["valid"])
@@ -246,7 +247,8 @@ class AgenticRuntimeTests(unittest.TestCase):
         self.assertEqual(result["tree_observed_input_tokens"], 100)
         self.assertIsNone(result["tree_input_tokens"])
         self.assertTrue((self.root / "runs/0001/attempt-001/task-tree.json").is_file())
-        self.assertIn("None使用默认值", (self.root / "runs/0001/attempt-001/answer.txt").read_text(encoding="utf-8"))
+        self.assertEqual((self.root / "runs/0001/attempt-001/answer.txt").read_text(encoding="utf-8"), "")
+        self.assertIn("None使用默认值", (self.root / "runs/0001/attempt-001/events.jsonl").read_text(encoding="utf-8"))
         self.assertEqual(sum(m == "turn/start" for m, _ in server.calls), 1)
 
     def test_matching_turn_rejection_is_terminal_failure_without_retry(self):

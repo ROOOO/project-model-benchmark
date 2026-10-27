@@ -368,7 +368,7 @@ def seal(root, scores_path):
     if gold.get("scoring_version", 1) == 2:
         value.update(scoring_version=2, scoring_weights=scoring_weights(gold))
         if check_inputs(root).get("offline_regrade"):
-            value["evaluator"] = "事后新增细则；评分者此前见过模型身份。重新匿名并隐藏性能，不是完全独立盲评。AI-assisted, no new inference."
+            value["evaluator"] = read(root / "evaluation/manifest.json")["note"] + " AI-assisted, no new inference."
     write(grading / "seal.json", value)
     return {"sealed_answers": len(scores)}
 
@@ -474,15 +474,36 @@ def summarize(root, partial=False):
             manifest = read(root / "evaluation/manifest.json")
             previous = read(root / "evaluation/previous-summary.json")
             result["evaluation"] = {k: manifest[k] for k in ["mode", "source_batch", "post_hoc", "evaluator_previously_saw_model_identity", "note"]}
+            if manifest.get("final_answer_repair"):
+                result["evaluation"]["final_answer_repair"] = manifest["final_answer_repair"]
+                result["evaluation"].update(new_inference_calls=0, costs_are_historical=True,
+                                               historical_capability_verification=previous.get("capability_verification"))
             result["previous_evaluation"] = {k: previous.get(k) for k in ["batch", "scoring_version", "scoring_weights", "conditions", "rows"]}
             result["previous_evaluation"]["scoring_version"] = previous.get("scoring_version", 1)
             result["previous_evaluation"]["scoring_weights"] = previous.get("scoring_weights", {"accuracy": 70, "readability": 30})
             old_rows = {r["answer_link"]: r for r in previous["rows"]}
             require(set(old_rows) == {r["answer_link"] for r in rows}, "Regrade differs from source attempt set")
+            repair_changes = {}
+            if manifest.get("final_answer_repair"):
+                from final_repair import FINAL_TEXT_METRICS
+                provenance_name = manifest["final_answer_repair"]["provenance"]
+                require(provenance_name in manifest["files_sha256"], "Final repair provenance is not sealed")
+                provenance = read(inside(root, provenance_name))
+                for entry in provenance["attempts"]:
+                    name = str(Path(entry["relative_result"]).with_name("answer.txt")).replace("\\", "/")
+                    require(name not in repair_changes and name in old_rows, "Final repair attempt set differs")
+                    require(set(entry["changed_metrics"]) <= FINAL_TEXT_METRICS, "Final repair changed a historical metric")
+                    repair_changes[name] = entry["changed_metrics"]
             for row in rows:
                 old = old_rows[row["answer_link"]]
                 condition_keys = ["slot_id", "attempt", "model", "effort", "repetition", "status", "valid", "selected", "actual_gateway_charge"] + (["service_tier", "speed_mode"] if tiered else [])
-                require(all(row.get(k) == old.get(k) for k in metric_names + condition_keys), "Regrade metrics/conditions differ from original")
+                changes = repair_changes.get(row["answer_link"], {})
+                for key in metric_names + condition_keys:
+                    if key in changes:
+                        require(old.get(key) == changes[key]["before"] and row.get(key) == changes[key]["after"],
+                                "Final repair metric differs from sealed provenance: " + key)
+                    else:
+                        require(row.get(key) == old.get(key), "Regrade metrics/conditions differ from original: " + key)
     return result
 
 
@@ -627,10 +648,17 @@ def evaluation_html(data, context):
     intro = '<p class="note">评分 V2：准确性50 / 任务覆盖20 / 边界洞察10 / 可读性20。关键事实错误优先于综合分审查；广度不按篇幅、术语数量或推理token计分。</p>'
     if data.get("evaluation"):
         intro += '<p class="note">' + html.escape(data["evaluation"]["note"]) + '</p>'
+        historical = data["evaluation"].get("historical_capability_verification")
+        if historical:
+            intro += '<p class="note">原批次历史能力验收：' + str(historical["archived_attempts"]) + ' 次，完整费用估算 USD ' + fmt(historical["known_complete_cost_usd"], 6) + '。本次离线修订新增模型采样 0 次、新增推理费用 USD 0；历史验收费用与正式样本费用分列，不重复计费。</p>'
     comparison = ""
     if data.get("previous_evaluation"):
         old = data["previous_evaluation"]
-        comparison = '<h2>原评分（版本不同，单独展示）</h2><p>同一批答案；分数变化来自评分口径，不是模型能力变化。原评分版本 ' + str(old["scoring_version"]) + '</p>' + condition_table(old["conditions"], old["scoring_weights"])
+        if data.get("evaluation", {}).get("final_answer_repair"):
+            comparison = '<h2>提取修复前评分（单独展示）</h2><p>本次依据原生 turn/completed 恢复最终正文，按修订目录封存的细则重新匿名评阅。分差可能来自文本恢复、评分细则与重新评阅，不能据此推断模型能力变化。原评分版本 ' + str(old["scoring_version"]) + '</p>'
+        else:
+            comparison = '<h2>原评分（版本不同，单独展示）</h2><p>同一批答案；分数变化来自评分口径，不是模型能力变化。原评分版本 ' + str(old["scoring_version"]) + '</p>'
+        comparison += condition_table(old["conditions"], old["scoring_weights"])
         old_rows = {r["answer_link"]: r for r in old["rows"]}
         comparison += '<details><summary>逐份新旧总分对照</summary><div class="tablewrap"><table><tr><th>组合/轮次/尝试</th><th>原总分</th><th>V2总分</th></tr>'
         for r in data["rows"]:

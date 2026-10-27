@@ -60,7 +60,8 @@ class SmokeRecoveryTests(unittest.TestCase):
         event("thread/tokenUsage/updated", 6, tokenUsage={"total": usage(), "last": usage()})
         event("thread/tokenUsage/updated", 6, "child", tokenUsage={"total": usage(200, 30), "last": usage(200, 30)})
         event("item/completed", 7, item={"type": "agentMessage", "id": "answer", "phase": "final_answer", "text": "原始答案不变。"})
-        event("turn/completed", 8, turn={"id": "turn", "status": "completed"})
+        event("turn/completed", 8, turn={"id": "turn", "status": "completed", "items": [
+            {"type": "agentMessage", "id": "answer", "phase": "final_answer", "text": "原始答案不变。"}]})
         event("turn/completed", 8, "child", turn={"id": "child-turn", "status": "completed"})
         for tid in ("root", "child"):
             ledger.reconcile_thread({"id": tid, "status": {"type": "idle"}}, 9)

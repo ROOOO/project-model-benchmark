@@ -142,6 +142,14 @@ benchmark.py validate --run-dir <new-sibling-directory>
 
 重审目录的 `preflight / run / resume / retest` 均拒绝；需要付费原题复测时指定原采样目录。新报告为独立HTML/CSV/JSON/ZIP，V2导出含版本、权重、四维分数、逐项原文依据及错误/遗漏；V1导出保持原结构。不同评分版本单独展示，不合并排名。
 
+原生最终答案提取存在缺陷、且归档包含完整完成事件时，可显式使用：
+
+```text
+benchmark.py regrade --run-dir <original-run> --rubric <original-run>/input/gold.json --output <new-sibling-directory> --repair-final-answers
+```
+
+此操作只离线回放归档，以最后根 `turn/completed` 确认的非空 `final_answer` items 为准，排除重试残留流和未被终结事件保留的项；不能用最后一个独立 completed item 猜测答案，它可能为空。缺失权威完成证据时拒绝修订。原记录、评分和事件保持不变；修订封存来源/派生文件哈希及提取策略，重新匿名评分，并披露主评分者此前已见身份。费用、用量、全树耗时复用历史，文本选择相关派生指标按原时间戳重算，不新增采样或费用。
+
 ## 闭卷原题复测
 
 ```text

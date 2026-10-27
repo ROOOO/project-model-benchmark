@@ -21,6 +21,8 @@ TOKEN_METRICS = {"input_tokens": "inputTokens", "cached_input_tokens": "cachedIn
 TERMINAL_TURNS = {"completed", "failed", "interrupted", "cancelled", "terminalObservedIdle"}
 IDLE_STATES = {"idle", "notLoaded", "systemError", "completed", "interrupted", "errored", "shutdown", "notFound"}
 PLAIN_ITEMS = {"agentMessage", "reasoning", "userMessage", "plan"}
+CANONICAL_FINAL_POLICY = "turn-completed-v1"
+LEGACY_FINAL_POLICY = "legacy"
 
 
 def _id(value):
@@ -107,7 +109,13 @@ class TreeLedger:
     and call ``mark_discovery_complete``.  This class cannot discover threads by
     itself and cannot prove a missing upstream billing receipt.
     """
-    def __init__(self, root_thread_id, root_turn_id, root_settings, started_at=0):
+    def __init__(self, root_thread_id, root_turn_id, root_settings, started_at=0,
+                 final_answer_policy=CANONICAL_FINAL_POLICY):
+        if final_answer_policy not in (CANONICAL_FINAL_POLICY, LEGACY_FINAL_POLICY):
+            raise ValueError("Unknown final answer policy")
+        self.final_answer_policy = final_answer_policy
+        self.root_final_completions = {}
+        self.root_turn_evidence_s = {}
         self.root_thread_id = root_thread_id
         self.root_turn_id = root_turn_id
         self.initial_root_turn_id = root_turn_id
@@ -142,11 +150,20 @@ class TreeLedger:
             self.errors.append(message)
 
     def _admit_root_turn(self, turn_id, elapsed_s=None):
+        node = self._node(self.root_thread_id)
+        if (self.final_answer_policy == CANONICAL_FINAL_POLICY and turn_id and numeric(elapsed_s)
+                and node["turns"].get(turn_id) not in TERMINAL_TURNS):
+            self.root_turn_evidence_s[turn_id] = max(self.root_turn_evidence_s.get(turn_id, elapsed_s), elapsed_s)
         if turn_id and turn_id not in self.root_turn_order:
             if self.root_turn_id is None:
                 self.root_turn_id = turn_id
-            node = self._node(self.root_thread_id)
-            settled_times = [value for value in (self.root_turn_completed_s, node["reconciled_idle_s"]) if numeric(value)]
+            latest_turn_evidence = (self.root_turn_evidence_s.get(self.root_turn_order[-1])
+                                    if self.final_answer_policy == CANONICAL_FINAL_POLICY and self.root_turn_order else None)
+            # Late orphan items and a later idle reconciliation do not move the
+            # endpoint of an already completed turn past a newer queued turn.
+            evidence = ((latest_turn_evidence,) if self.final_answer_policy == CANONICAL_FINAL_POLICY
+                        else (self.root_turn_completed_s, node["reconciled_idle_s"]))
+            settled_times = [value for value in evidence if numeric(value)]
             if self.root_turn_order and numeric(elapsed_s) and settled_times and elapsed_s <= max(settled_times):
                 # A previously unknown old turn can arrive from an RPC queue
                 # after a newer answer. Admit it as history, preserving the
@@ -379,6 +396,8 @@ class TreeLedger:
                             self._item(tid, turn_id, item, "item/completed", elapsed_s)
                     if turn.get("items"):
                         out["turn"]["items"] = [self._safe_item(tid, item) for item in turn["items"] if isinstance(item, dict)]
+                    if tid == self.root_thread_id and method == "turn/completed" and status == "completed":
+                        self._capture_final_completion(turn_id, turn.get("items", []), elapsed_s)
                     if tid == self.root_thread_id and turn_id == self.root_turn_order[-1] and method == "turn/completed":
                         self.answer_ready_s = max((entry["completed_s"] for entry in self.final_messages if entry["completed_s"] is not None), default=None)
         elif method in ("item/started", "item/completed") and node is not None:
@@ -427,6 +446,38 @@ class TreeLedger:
                     "text": None, "completed": False, "deltas": [], "first_delta_s": None,
                     "last_delta_s": None, "completed_s": None})
 
+    def _capture_final_completion(self, turn_id, items, elapsed):
+        """Only the completed turn confirms which retry stream became its answer."""
+        if self.final_answer_policy == LEGACY_FINAL_POLICY:
+            return
+        previous = self.root_final_completions.get(turn_id)
+        accepted, seen = [], set()
+        for item in items:
+            if not isinstance(item, dict) or item.get("type") != "agentMessage" or item.get("phase") != "final_answer":
+                continue
+            text, item_id = item.get("text"), _id(item.get("id"))
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if item_id is None or item_id in seen:
+                self._error("Invalid or duplicate authoritative final item ID")
+                continue
+            seen.add(item_id)
+            entry = copy.deepcopy(self._message(item_id, turn_id))
+            entry.update(phase="final_answer", text=text, completed=True)
+            stream = "".join(entry["deltas"])
+            if stream and stream.replace("\r\n", "\n") != text.replace("\r\n", "\n"):
+                self._error("Final answer stream disagrees with completed message")
+            accepted.append(entry)
+        if previous is not None and previous["items"]:
+            before = [(item["id"], item["text"].replace("\r\n", "\n")) for item in previous["items"]]
+            after = [(item["id"], item["text"].replace("\r\n", "\n")) for item in accepted]
+            if after and before != after:
+                self._error("Conflicting authoritative final completion")
+            return
+        if previous is not None and not accepted:
+            return
+        self.root_final_completions[turn_id] = {"t_s": elapsed, "items": accepted}
+
     def _item(self, tid, turn_id, item, method, elapsed):
         kind, item_id = item.get("type"), _id(item.get("id"))
         node = self._node(tid)
@@ -444,7 +495,7 @@ class TreeLedger:
                     entry["completed_s"] = elapsed
                 entry["completed"] = True
                 stream = "".join(entry["deltas"])
-                if entry["phase"] == "final_answer" and stream and stream.replace("\r\n", "\n") != entry["text"].replace("\r\n", "\n"):
+                if self.final_answer_policy == LEGACY_FINAL_POLICY and entry["phase"] == "final_answer" and stream and stream.replace("\r\n", "\n") != entry["text"].replace("\r\n", "\n"):
                     self._error("Final answer stream disagrees with completed message")
         elif kind not in PLAIN_ITEMS and item_id:
             tool = self.tools.setdefault((tid, item_id), {"thread_id": tid, "item_id": item_id, "type": _id(kind), "status": None})
@@ -535,6 +586,9 @@ class TreeLedger:
 
     @property
     def final_messages(self):
+        if self.final_answer_policy == CANONICAL_FINAL_POLICY:
+            completion = self.root_final_completions.get(self.root_turn_order[-1]) if self.root_turn_order else None
+            return completion["items"] if completion is not None else []
         return [entry for entry in self.messages.values() if entry["phase"] == "final_answer" and entry["turn_id"] == self.root_turn_order[-1]] if self.root_turn_order else []
 
     @property
@@ -549,6 +603,8 @@ class TreeLedger:
 
     def accounting_issues(self):
         issues = list(self.errors)
+        if self.final_answer_policy == CANONICAL_FINAL_POLICY and self.root_status == "completed" and not self.final_messages:
+            issues.append("Missing authoritative root final-answer completion")
         if not self.transport_complete:
             issues.append("Transport continuity unknown")
         if not self.discovery_complete:
@@ -583,7 +639,7 @@ class TreeLedger:
 
     def snapshot(self):
         related = set(self.related_thread_ids)
-        return copy.deepcopy({"schema_version": 1, "root_thread_id": self.root_thread_id,
+        snapshot = {"schema_version": 1, "root_thread_id": self.root_thread_id,
                 "root_turn_id": self.root_turn_id, "initial_settings": self.initial_settings,
                 "initial_root_turn_id": self.initial_root_turn_id,
                 "root_turn_order": self.root_turn_order,
@@ -593,11 +649,16 @@ class TreeLedger:
                 "tools": [value for value in self.tools.values() if value["thread_id"] in related],
                 "errors": self.errors, "tree_terminal": self.tree_terminal,
                 "accounting_complete": self.accounting_complete, "accounting_issues": self.accounting_issues(),
-                "discovery_complete": self.discovery_complete, "events": self.events})
+                "discovery_complete": self.discovery_complete, "events": self.events}
+        if self.final_answer_policy != LEGACY_FINAL_POLICY:
+            snapshot["final_answer_policy"] = self.final_answer_policy
+        return copy.deepcopy(snapshot)
 
     @classmethod
-    def from_snapshot(cls, snapshot):
-        ledger = cls(snapshot["root_thread_id"], snapshot.get("initial_root_turn_id", snapshot["root_turn_id"]), snapshot["initial_settings"], snapshot.get("started_at", 0))
+    def from_snapshot(cls, snapshot, final_answer_policy=None):
+        policy = final_answer_policy if final_answer_policy is not None else snapshot.get("final_answer_policy", LEGACY_FINAL_POLICY)
+        ledger = cls(snapshot["root_thread_id"], snapshot.get("initial_root_turn_id", snapshot["root_turn_id"]),
+                     snapshot["initial_settings"], snapshot.get("started_at", 0), final_answer_policy=policy)
         for event in snapshot.get("events", []):
             method, elapsed = event.get("method"), event.get("t_s", 0)
             if method == "ledger/threadReconciled":
