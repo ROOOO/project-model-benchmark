@@ -51,6 +51,7 @@ def parser():
     comparison.add_argument("--output", required=True)
     comparison.add_argument("--models", nargs="+")
     comparison.add_argument("--assessment", help="JSON with conclusion, evidence and limitations; omitted uses neutral notes")
+    comparison.add_argument("--estimate-answer-tps", action="store_true", help="Estimate final text TPS with a pinned, preloaded local o200k_base proxy")
     adoption = sub.add_parser("adopt-smoke", help="Reuse verified capability checks across identical study environments; no inference")
     adoption.add_argument("--run-dir", required=True)
     adoption.add_argument("--source", required=True)
@@ -98,7 +99,10 @@ def main(argv=None):
     elif args.command == "regrade":
         value = regrade(args.run_dir, args.rubric, args.output, repair_final_answers=args.repair_final_answers)
     elif args.command == "compare":
-        value = compare(args.run_dirs, args.output, args.models, args.assessment)
+        if args.estimate_answer_tps:
+            value = compare(args.run_dirs, args.output, args.models, args.assessment, estimate_answer_tps=True)
+        else:
+            value = compare(args.run_dirs, args.output, args.models, args.assessment)
     elif args.command == "adopt-smoke":
         from agentic_runtime import adopt_capability
         value = adopt_capability(args.run_dir, args.source)

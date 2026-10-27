@@ -86,6 +86,20 @@ for (const c of cases) for (const effort of efforts) for (const sort of ['config
   for (const table of ['qualityTable tbody', 'performanceTable tbody', 'costTable tbody', 'agenticTable tbody']) {
     eq(countRows(node('#' + table).innerHTML), groups.length, table + ' filter count');
   }
+  if (data.final_tps_estimation) {
+    eq(node('#proxyTpsSection').hidden, false, 'proxy section visible');
+    ok(node('#proxyTpsNote').textContent.includes('映射未核实'), 'proxy mapping disclosure missing');
+    ok(node('#proxyTpsNote').textContent.includes('不是原生正文 token 用量'), 'proxy attribution disclosure missing');
+    eq(countRows(node('#proxyTpsTable tbody').innerHTML), groups.length, 'proxy table filter count');
+    const available = groups.filter(g => finite(g.statistics?.estimated_final_text_tps?.median));
+    eq((node('#proxyTpsChart').innerHTML.match(/class="center"/g) || []).length, available.length, 'proxy chart availability');
+    for (const g of groups) {
+      const expected = `${g.statistics?.estimated_final_text_tps?.n ?? 0} / ${g.valid_completed ?? 0}`;
+      ok(node('#proxyTpsTable tbody').innerHTML.includes(expected), 'proxy n missing');
+    }
+  } else {
+    eq(node('#proxyTpsSection').hidden, true, 'proxy section hidden without opt-in');
+  }
   eq(countRows(node('#crossCaseTable tbody').innerHTML), cases.reduce((sum, each) => sum +
     (each.conditions || []).filter(g => effort === 'all' || g.effort === effort).length, 0));
   const maxima = c.dimension_maxima || c.weights || {};

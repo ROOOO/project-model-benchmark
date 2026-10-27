@@ -18,6 +18,18 @@ Fast 优先与同一原采样批次、同题同模型同思考档的 Standard �
 
 价格单独展示，不生成价格加权质量总分。沿用各批次封存的估算及其价格日期，不用新价格改写历史成本；未知费用不视为免费。质量触顶时说明区分度不足，小样本与跨批条件差异限制结论。
 
+### 正文 TPS 代理估算
+
+需要估算已封存的工程代理最终正文速度时，可为 `compare` 显式增加 `--estimate-answer-tps`。优先保留已有可归属的原生可见 TPS；其他项目以权威根 `turn/completed` 确认的单个最终正文为准，用 `o200k_base` 计算全文 token 数，再除以首末非空正文片段的客户端到达间隔。流文本不完整、与最终正文不一致、时间缺失或间隔不正时保留未知，不用重试残留或响应总用量代替。
+
+这是统一代理分词，不声称与被测模型的 tokenizer 相同；首片段和客户端缓冲影响结果。新增估算字段与原生可见 TPS、根／全树端到端吞吐分列，展示每组实际 n，逐样本列出时间、token 数与未知原因。模型映射、分词版本、词表 SHA256 和算法来源随新报告封存；不改写原批次、历史费用或评分，不新增采样。
+
+默认执行不依赖第三方库。使用估算选项时，以独立 Python 环境安装 `tiktoken==0.14.0`，将 `TIKTOKEN_CACHE_DIR` 指向该环境的独立词表缓存，先用同一 Python 执行 `import tiktoken; tiktoken.get_encoding('o200k_base')` 预加载公开词表。比较时仅使用预先缓存且 SHA256 为 `446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d` 的词表，不联网下载；正文始终在本地分词。依赖或词表缺失时明确停止，不生成误导性结果。
+
+```text
+<isolated-python> benchmark.py compare --run-dirs <sealed-run> --output <new-directory> --estimate-answer-tps
+```
+
 可传入 `--assessment <file>`，内容为：
 
 ```json

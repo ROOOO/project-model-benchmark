@@ -11,6 +11,7 @@ import zipfile
 from core import (METRICS, check_inputs, check_sensitive, digest,
                   distribution, inside, now, numeric, read, require, scoring_gold,
                   scoring_weights, sha, write)
+from final_tps import ESTIMATE_FIELDS, estimate_final_tps, load_proxy_estimator
 from reporting import AGENTIC_FLAGS, AGENTIC_METRICS, check_artifact_sensitive, execution_identity, idle, native_evidence_files, runtime_fingerprint, summarize, validate_records
 
 
@@ -129,7 +130,7 @@ def _source_id(index, root):
     return f"source-{index:03d}-{digest(str(root))[:8]}"
 
 
-def build_data(run_dirs, models=None, assessment=None):
+def build_data(run_dirs, models=None, assessment=None, *, final_tps=None):
     """Reconstruct sealed summaries without source validation/report side effects."""
     roots = _paths(run_dirs)
     selected_models = set(models) if models is not None else None
@@ -188,6 +189,9 @@ def build_data(run_dirs, models=None, assessment=None):
                         remote_completion="unknown" if row["status"] != "completed" else "completed",
                         actual_gateway_charge=row.get("actual_gateway_charge"),
                         dimension_maxima=weights)
+            if final_tps is not None:
+                answer = inside(root, row["answer_link"]).read_bytes().decode("utf-8-sig") if row.get("selected") and row.get("valid") and row.get("status") == "completed" else ""
+                item.update(estimate_final_tps(record, row, answer, final_tps[0]))
             source_rows.append(item)
             rows.append(item)
             if not (item["valid"] and item["status"] == "completed"):
@@ -227,7 +231,8 @@ def build_data(run_dirs, models=None, assessment=None):
                               == (condition["model"], condition["effort"], tier)]
             good = [r for r in condition_rows if r["selected"] and r["valid"] and r["status"] == "completed"]
             maxima = {k: weights.get(k) for k in DIMENSIONS}
-            statistics = {k: distribution([r.get(k) for r in good]) for k in STAT_FIELDS}
+            fields = (*STAT_FIELDS, "estimated_final_text_tps", "estimated_final_text_tokens", "estimated_final_stream_s") if final_tps is not None else STAT_FIELDS
+            statistics = {k: distribution([r.get(k) for r in good]) for k in fields}
             item = {"id": digest({"source": source_id, "model": condition["model"], "effort": condition["effort"], "tier": tier}),
                     "case": case_key, "batch": root.name, "origin_batch_id": origin,
                     "execution_mode": execution_mode, "execution_profile_id": execution_id,
@@ -275,6 +280,12 @@ def build_data(run_dirs, models=None, assessment=None):
                               "omission_answers": "原评分记录中的遗漏标记；不等于正式覆盖度扣分答案数。",
                               "fast_observations": "同批优先；跨批仅在一对候选唯一时显示历史观察；不逐次配对。"},
               "grading_details": details}
+    if final_tps is not None:
+        result["final_tps_estimation"] = {**final_tps[1],
+            "available_samples": sum(numeric(r.get("estimated_final_text_tps")) for r in rows),
+            "selected_valid_samples": sum(r["selected"] and r["valid"] and r["status"] == "completed" for r in rows)}
+        result["definitions"]["estimated_final_text_tps"] = "权威最终正文以 o200k_base 代理分词的 token 数除以首末非空片段的客户端到达间隔；模型 tokenizer 映射未核实，非原生计量。"
+        result["limitations"] = [*DEFAULT_LIMITATIONS, "正文估算 TPS 使用 o200k_base 代理；模型 tokenizer 映射未核实，首个片段及客户端缓冲可能影响结果，缺失时间戳不估算。"]
     if any(c["execution_mode"] == "project-readonly" for c in values):
         result["definitions"].update(
             answer_ready_s="根最终答案交付完成；可能早于所有子任务结束。",
@@ -317,17 +328,20 @@ def export_tables(data):
                      *AGENTIC_METRICS, *AGENTIC_FLAGS,
                      "critical_errors", "errors", "omissions", "actual_gateway_charge", "remote_completion",
                      "answer_sha256", "result_sha256", "answer_link", "source_answer_url"]
+    if data.get("final_tps_estimation"):
+        sample_fields += list(ESTIMATE_FIELDS)
     return {"conditions.csv": _csv(conditions, condition_fields),
             "samples.csv": _csv(data["samples"], sample_fields),
             "fast-observations.csv": _csv(data["paired_speed_observations"], PAIR_FIELDS)}
 
 
-def compare(run_dirs, output, models=None, assessment=None):
+def compare(run_dirs, output, models=None, assessment=None, *, estimate_answer_tps=False):
     roots, output = _paths(run_dirs), Path(output).expanduser().resolve()
     require(not output.exists() and all(not output.is_relative_to(p) and not p.is_relative_to(output) for p in roots),
             "Use a new comparison output directory outside all source runs")
+    final_tps = load_proxy_estimator() if estimate_answer_tps else None
     before = {str(p): fingerprint(p) for p in roots}
-    data = build_data(roots, models, assessment)
+    data = build_data(roots, models, assessment, final_tps=final_tps)
     template_path = Path(__file__).resolve().parent.parent / "assets/comparison.html"
     template = template_path.read_text(encoding="utf-8")
     require(template.count("__COMPARISON_DATA__") == 1, "Comparison template must contain one data marker")

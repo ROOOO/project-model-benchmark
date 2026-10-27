@@ -11,7 +11,7 @@ description: 从工程常见问题制作固定证据实验，对比 Codex 模型
 
 创建、解释或修改本 skill 不启动付费测试；用户要求运行 benchmark 时，完成准备后直接执行已授权矩阵，无需重复确认。
 
-脚本入口为本 skill 的 `scripts/benchmark.py`，Python 3.11+，仅使用标准库。日常工程选型默认使用 `project-readonly`，准备源码快照和原生工具权限时读 [工程代理执行](references/agentic.md)；其他接口读 [执行接口](references/execution.md)；选题与评分读 [实验方法](references/methodology.md)；已有结果的增强视图读 [离线综合报告](references/comparison.md)。不要重写一套临时 runner。
+脚本入口为本 skill 的 `scripts/benchmark.py`，Python 3.11+；默认仅使用标准库。显式启用正文 TPS 代理估算时，额外使用独立安装的 `tiktoken`，详见 [离线综合报告](references/comparison.md)。日常工程选型默认使用 `project-readonly`，准备源码快照和原生工具权限时读 [工程代理执行](references/agentic.md)；其他接口读 [执行接口](references/execution.md)；选题与评分读 [实验方法](references/methodology.md)；已有结果的增强视图读 [离线综合报告](references/comparison.md)。不要重写一套临时 runner。
 
 ## 新建测试
 
