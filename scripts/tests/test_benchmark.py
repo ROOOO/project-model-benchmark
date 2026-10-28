@@ -1,6 +1,7 @@
 """Offline protocol/transport regression tests; never invokes a real model."""
 import collections
 import csv
+import io
 import json
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core
-from benchmark import parser, retest
+from benchmark import main, parser, retest
 from core import build_schedule, check_inputs, home, metrics, prepare, read, select_project, sha, write
 from reporting import archive, blind, build_report, markdown, seal, summarize, validate
 import reporting
@@ -95,7 +96,7 @@ class BenchmarkTests(unittest.TestCase):
         path = self.completed_scores()
         seal(self.root, path)
         build_report(self.root)
-        validate(self.root)
+        validate(self.root, write_receipt=True)
 
     def completed_scores(self):
         scores = read(self.root / "grading/packet/scores-template.json")
@@ -269,6 +270,48 @@ class BenchmarkTests(unittest.TestCase):
         self.change_csv(lambda rows: rows[1].__setitem__(rows[0].index("elapsed_s"), "999999"))
         with self.assertRaisesRegex(ValueError, "CSV differs"):
             validate(self.root)
+
+    def artifact_snapshot(self):
+        return {p.relative_to(self.root).as_posix(): (sha(p), p.stat().st_mtime_ns)
+                for p in self.root.rglob("*") if p.is_file()}
+
+    def test_repeated_cli_validation_preserves_delivered_files_and_archive(self):
+        self.complete()
+        archive(self.root)
+        before = self.artifact_snapshot()
+        with patch("sys.stdout", new_callable=io.StringIO), patch("benchmark.Server", side_effect=AssertionError("inference started")):
+            self.assertEqual(main(["validate", "--run-dir", str(self.root)]), 0)
+            self.assertEqual(main(["validate", "--run-dir", str(self.root)]), 0)
+        self.assertEqual(self.artifact_snapshot(), before)
+        with patch("reporting.shutil.which", return_value=None):
+            self.assertTrue(validate(self.root)["passed"])
+        self.assertEqual(self.artifact_snapshot(), before)
+
+    def test_validation_does_not_create_missing_receipts(self):
+        self.complete()
+        for name in ("validation.json", "ui-check.json"):
+            (self.root / name).unlink()
+        before = self.artifact_snapshot()
+        self.assertTrue(validate(self.root)["passed"])
+        self.assertEqual(self.artifact_snapshot(), before)
+        with patch("reporting.shutil.which", return_value=None):
+            self.assertTrue(validate(self.root)["passed"])
+        self.assertEqual(self.artifact_snapshot(), before)
+
+    def test_report_refreshes_receipts_before_packaging(self):
+        self.complete()
+        from zipfile import ZipFile
+        with patch("sys.stdout", new_callable=io.StringIO):
+            main(["report", "--run-dir", str(self.root)])
+        original = (self.root / "report.html").read_bytes()
+        write(self.root / "assessment.json", {"conclusion": "Updated review", "evidence": ["Fixture results"], "limitations": ["Synthetic task"]})
+        with patch("sys.stdout", new_callable=io.StringIO), patch("reporting.shutil.which", return_value=None):
+            main(["report", "--run-dir", str(self.root)])
+        self.assertNotEqual(original, (self.root / "report.html").read_bytes())
+        self.assertIsNone(read(self.root / "ui-check.json")["passed"])
+        with ZipFile(self.root / "benchmark-results.zip") as package:
+            for name in ("report.html", "assessment.json", "validation.json", "ui-check.json"):
+                self.assertEqual(package.read(name), (self.root / name).read_bytes())
 
     def test_validate_rejects_duplicate_csv_rows(self):
         self.complete()

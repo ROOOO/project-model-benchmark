@@ -840,7 +840,8 @@ def validate_records(root):
     return attempts
 
 
-def validate(root, partial=False):
+def validate(root, partial=False, *, write_receipt=False):
+    """Check a run without changing delivered artifacts; report writes receipts."""
     root = Path(root)
     p = check_inputs(root)
     score_data(root, partial)
@@ -866,11 +867,14 @@ def validate(root, partial=False):
         if node:
             checked = subprocess.run([node, str(Path(__file__).with_name("check_report.cjs")), str(root / "report.html")], capture_output=True, text=True, encoding="utf-8", timeout=30)
             require(checked.returncode == 0, "Offline report interaction check failed")
-            write(root / "ui-check.json", json.loads(checked.stdout))
+            ui_check = json.loads(checked.stdout)
         else:
-            write(root / "ui-check.json", {"passed": None, "reason": "Optional Node.js unavailable; HTML links/IDs checked by Python", "browser_visual_check": "not performed"})
+            ui_check = {"passed": None, "reason": "Optional Node.js unavailable; HTML links/IDs checked by Python", "browser_visual_check": "not performed"}
+        if write_receipt:
+            write(root / "ui-check.json", ui_check)
     value = {"at": now(), "passed": True, "attempts_checked": len(attempts), "planned_slots": len(p["schedule"]), "scores_sealed": (root / "grading/seal.json").exists(), "partial_report": partial, "no_new_inference": True}
-    write(root / "validation.json", value)
+    if write_receipt:
+        write(root / "validation.json", value)
     return value
 
 

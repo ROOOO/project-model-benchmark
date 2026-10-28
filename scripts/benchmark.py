@@ -140,7 +140,7 @@ def main(argv=None):
             value = seal(root, args.scores)
         elif args.command == "report":
             data = build_report(root, args.partial)
-            checked = validate(root, args.partial)
+            checked = validate(root, args.partial, write_receipt=True)
             value = archive(root) | {"report": str(root / "report.html"), "validation": checked, "valid_completed": data["valid_completed"], "planned": data["planned"]}
         else:
             value = validate(root, args.partial)

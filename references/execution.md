@@ -120,7 +120,7 @@ benchmark.py validate --run-dir <run>
 
 `report --partial` 仅用于明确标识的未完成报告，可缺评分；它不构成完整验收，也不据此宣称最优模型。脚本产生 HTML、UTF-8 BOM CSV、完整 JSON、validation 和 ZIP。若费用只覆盖部分样本，合计须连同覆盖次数阅读。
 
-`validate` 从原始记录重算全部 JSON 字段（生成时间除外），核对 CSV 表头和逐行内容，并用相同渲染函数核对完整 HTML；导出文件不齐、数值、答案或标签不一致均拒绝通过。修改选择建议后重新运行 `report`，不要直接编辑导出文件。
+`validate` 从原始记录重算全部 JSON 字段（生成时间除外），核对 CSV 表头和逐行内容，并用相同渲染函数核对完整 HTML；导出文件不齐、数值、答案或标签不一致均拒绝通过。独立执行只返回检查结果，不写收据或改动已交付文件。`report` 在检查成功后写入校验收据，再打包并核对 ZIP 字节。修改选择建议后重新运行 `report`，不要直接编辑导出文件。
 
 若所有尝试都失败而没有可评分答案，跳过 blind/seal，用 `report --partial` 展示失败与缺口；不能生成质量排名。
 
@@ -173,4 +173,4 @@ benchmark.py compare --run-dirs <run-a> <run-b> --output <new-directory> --model
 
 运行 `python -X utf8 -m unittest discover -s <skill>/scripts/tests -v`。历史回放用 `python -X utf8 <skill>/scripts/replay_history.py --cohorts <old-batch-1> <old-batch-2> <old-batch-3> --output <new-validation-directory>`，只读取本机历史记录，输出独立报告，绝不启动推理。历史业务材料不随 skill 分发。
 
-Node.js 可用时，validate 会额外运行离线交互脚本检查，保存 `ui-check.json`；只模拟 DOM 与选择操作，不打开浏览器、不发网络请求，也不冒充浏览器目视检查。完整运行仍只要求 Python 标准库。
+Node.js 可用时，validate 会额外运行离线交互脚本检查；`report` 保存该结果为 `ui-check.json`。检查只模拟 DOM 与选择操作，不打开浏览器、不发网络请求，也不冒充浏览器目视检查。完整运行仍只要求 Python 标准库。
