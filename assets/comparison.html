@@ -12,7 +12,7 @@
 </style>
 </head>
 <body>
-<header class="hero"><div class="wrap"><div class="eyebrow">FROZEN PROTOCOL · OFFLINE COMPARISON</div><h1 id="pageTitle">工程模型综合评测</h1><p>按题目、评分细则和执行协议分别复核质量，再比较完成速度、输出表现和历史费用。不同题目的分数保持各自尺度，不生成跨题加权排名。</p><div id="meta" class="meta"></div><nav class="navlinks"><a href="#speedSection">完成速度</a><a href="#agenticSection">代理工作流</a><a href="#crossCaseSection">跨题并排</a><a href="#limitsSection">来源与限制</a></nav></div></header>
+<header class="hero"><div class="wrap"><div class="eyebrow">FROZEN PROTOCOL · OFFLINE COMPARISON</div><h1 id="pageTitle">工程模型综合评测</h1><p>按题目、评分细则和执行模式并列各批配置，再比较完成速度、输出表现和历史费用。每批统计独立保留；不同题目的分数保持各自尺度，不生成跨题加权排名。</p><div id="meta" class="meta"></div><nav class="navlinks"><a href="compact.html">紧凑对照表</a><a href="#speedSection">完成速度</a><a href="#agenticSection">代理工作流</a><a href="#crossCaseSection">跨题并排</a><a href="#limitsSection">来源与限制</a></nav></div></header>
 <main class="wrap layout">
 <div class="intro"><section class="panel"><h2>本次分析</h2><div id="assessmentConclusion"></div><div class="reading-rule"><span>复核准确性与覆盖</span><span>观察等待与波动</span><span>比较可读性与费用</span></div></section><section class="panel"><h2>结论依据</h2><div id="assessmentEvidence"></div><p class="sub">本页复用已封存的答案、评分和历史性能，不新增被测模型采样。重评分不会产生新样本。</p></section></div>
 <div class="metric-grid" id="metrics"></div>
@@ -37,7 +37,18 @@
 const DATA=JSON.parse(document.getElementById('comparison-data').textContent);
 const $=s=>document.querySelector(s),esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const finite=x=>typeof x==='number'&&Number.isFinite(x),fmt=(x,d=1)=>finite(x)?x.toFixed(d):'未知';
-const cases=DATA.cases||[],dimensions=[['accuracy','准确性'],['coverage','覆盖'],['readability','可读性'],['insight','洞察']];
+const scoringCases=DATA.cases||[];
+function displayTopics(groups){const topics=new Map();for(const c of groups){
+ const key=JSON.stringify([c.case_id,c.rubric_sha256,c.scoring_version,c.execution_mode]),maxima=c.dimension_maxima||c.weights||{},scale=JSON.stringify(Object.keys(maxima).sort().map(k=>[k,maxima[k]]));
+ let topic=topics.get(key);if(!topic){topic={...c,id:`topic-${topics.size+1}`,conditions:[],sources:[],member_case_ids:[],execution_profile_ids:[],scale};topics.set(key,topic)}
+ if(topic.scale!==scale)throw new Error('同题维度满分不一致，不能并列展示');
+ topic.conditions.push(...(c.conditions||[]));topic.member_case_ids.push(c.id);
+ if(!topic.execution_profile_ids.includes(c.execution_profile_id))topic.execution_profile_ids.push(c.execution_profile_id);
+ for(const source of c.sources||[])if(!topic.sources.some(s=>s.id===source.id))topic.sources.push(source);
+ }return [...topics.values()]}
+const cases=displayTopics(scoringCases),dimensions=[['accuracy','准确性'],['coverage','覆盖'],['readability','可读性'],['insight','洞察']];
+const topicBaseLabel=c=>`${c.title||c.label||c.case_id} · V${c.scoring_version??'?'} · ${executionLabel(c)}`;
+const topicLabel=c=>{const label=topicBaseLabel(c);return cases.some(other=>other.id!==c.id&&topicBaseLabel(other)===label)?`${label} · 细则 ${String(c.rubric_sha256||'未知').slice(0,8)} · ${c.id}`:label};
 const palette=['#2569b0','#bd6525','#157b66','#8b65a5','#ab4762','#4d7e86','#8b7728'];
 const models=[...new Set(cases.flatMap(c=>c.conditions||[]).map(g=>g.model))].sort(),color=g=>palette[Math.max(0,models.indexOf(g.model))%palette.length];
 const speed=g=>g.speed_mode||(g.service_tier==='priority'?'Fast':'Standard'),isFast=g=>g.service_tier==='priority'||speed(g).toLowerCase()==='fast';
@@ -74,8 +85,9 @@ function chart(target,groups,key,unit,{compact=false,digits=1,central='median'}=
  marks+=`<circle class="center" cx="${x(v)}" cy="${y}" r="4.3" fill="${color(g)}" stroke="white" stroke-width="1.1"><title>${esc(title)}</title></circle><text class="value" x="${W-R+14}" y="${y+4}">${fmt(v,digits)}</text>`});
  el.innerHTML=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(key+'：'+(central==='mean'?'均值':'中位数')+'、范围和样本点')}" xmlns="http://www.w3.org/2000/svg"><text class="axis" x="${W-R}" y="14" text-anchor="end">${esc(unit)}</text>${grid}${marks}</svg>`;
 }
-function explicitPairs(c,gs){const ids=new Set(gs.map(g=>g.id));return (DATA.paired_speed_observations||[]).filter(p=>p.case===c.id&&ids.has(p.standard_condition)&&ids.has(p.fast_condition))}
-function renderFast(c,gs){const pairs=explicitPairs(c,gs);const kind=p=>p.kind==='same-batch'?'同批观察':'跨批历史观察';$('#pairingNotes').innerHTML=paragraphs((DATA.pairing_notes||[]).filter(p=>typeof p==='string'||!p.case||p.case===c.id));
+function memberCases(c){return new Set(c.member_case_ids||[c.id])}
+function explicitPairs(c,gs){const ids=new Set(gs.map(g=>g.id)),members=memberCases(c);return (DATA.paired_speed_observations||[]).filter(p=>members.has(p.case)&&ids.has(p.standard_condition)&&ids.has(p.fast_condition))}
+function renderFast(c,gs){const pairs=explicitPairs(c,gs);const kind=p=>p.kind==='same-batch'?'同批观察':'跨批历史观察';$('#pairingNotes').innerHTML=paragraphs((DATA.pairing_notes||[]).filter(p=>typeof p==='string'||!p.case||memberCases(c).has(p.case)));
  if(!pairs.length){$('#fastChart').innerHTML='<div class="empty">这一筛选没有明确可匹配的 Standard / Fast 观察。</div>';$('#fastTable').innerHTML='';return}
  const W=1340,L=420,R=200,T=24,row=46,H=T+pairs.length*row+40,min=Math.min(0,...pairs.map(p=>p.elapsed_reduction_pct??0)),max=Math.max(0,...pairs.map(p=>p.elapsed_reduction_pct??0)),low=min<0?min*1.15:0,high=max>0?max*1.15:1,x=v=>L+(v-low)/(high-low)*(W-L-R);
  let marks='';for(let i=0;i<=5;i++){let v=low+(high-low)*i/5,xx=x(v);marks+=`<line class="grid" x1="${xx}" y1="15" x2="${xx}" y2="${H-30}"/><text class="axis" x="${xx}" y="${H-8}" text-anchor="middle">${fmt(v,0)}%</text>`}
@@ -87,7 +99,7 @@ function renderAgentic(c,gs){const active=c.execution_mode==='project-readonly';
  chart('#answerReadyChart',gs,'answer_ready_s','秒',{compact:true});chart('#finalTtftChart',gs,'final_ttft_s','秒',{compact:true});chart('#progressChart',gs,'first_progress_s','秒',{compact:true});chart('#rootThroughputChart',gs,'root_output_e2e_tps','根输出 tokens / 答案就绪秒数',{compact:true});chart('#agentCountChart',gs,'delegation_count','唯一子孙线程数',{digits:0});
  $('#agenticTable tbody').innerHTML=gs.map(g=>`<tr><td>${configHTML(g)}</td><td>${active?`${g.delegated_answers??'未知'} / ${g.delegation_observed_answers??'未知'}`:'未知'}</td><td>${fmt(value(g,'delegation_count'),0)}</td><td>${fmt(value(g,'answer_ready_s'))} / ${fmt(value(g,'workflow_elapsed_s'))}</td><td>${fmt(value(g,'first_progress_s'))} / ${fmt(value(g,'final_ttft_s'))}</td><td>${['root_','child_','tree_'].map(p=>fmt(value(g,p+'output_tokens'),0)).join(' / ')}</td><td>${['root_output_e2e_tps','tree_output_e2e_tps'].map(k=>fmt(value(g,k))).join(' / ')}</td><td>${['root_','child_','tree_'].map(p=>fmt(value(g,p+'estimated_api_usd','mean'),5)).join(' / ')}</td><td>${active?`${g.accounting_complete_attempts??'未知'} / ${g.attempts??'未知'}`:'未知'}</td><td>${fmt(g.observed_cost_coverage_attempts?g.known_observed_cost_usd:null,5)}</td></tr>`).join('');
 }
-function renderCase(){const c=currentCase();if(!c)return;const gs=filtered(c);$('#caseTitle').textContent=c.title||c.label||c.case_id;$('#caseNote').textContent=`${c.label||c.case_id} · 评分 V${c.scoring_version??'未知'} · rubric ${String(c.rubric_sha256||'未知').slice(0,12)} · ${executionLabel(c)} · 本题各批分别统计`;
+function renderCase(){const c=currentCase();if(!c)return;const gs=filtered(c);$('#caseTitle').textContent=c.title||c.label||c.case_id;$('#caseNote').textContent=`评分 V${c.scoring_version??'未知'} · rubric ${String(c.rubric_sha256||'未知').slice(0,12)} · ${executionLabel(c)} · 当前 ${gs.length} 个配置，来自 ${c.member_case_ids.length} 个评分组、${c.execution_profile_ids.length} 个运行环境；同题结果并列，各批原统计保持独立，跨批差异不能直接归因于模型。`;
  $('#caseSources').innerHTML=(c.sources||[]).map(sourceLink).join(' · ');$('#qualityKey').innerHTML=dimensions.map(([k,l])=>`<span>${l} / ${fmt(maximum(c,k),0)}</span>`).join('');
  const ceilings=dimensions.flatMap(([k,l])=>{const m=maximum(c,k),rows=gs.flatMap(g=>g.rows||[]).filter(r=>finite(r[k]));if(!finite(m)||!rows.length)return[];const full=rows.filter(r=>r[k]===m).length;return full?[`${l} ${full}/${rows.length} 触顶`]:[]});
  $('#ceilingNote').textContent=ceilings.length?`${ceilings.join('；')}。触顶答案无法用本项分数进一步区分；满分集中时须承认区分度不足。不能据此推断一般任务中没有差异。`:'按各题细则解释分差，并复核原文、错误与遗漏。小样本差异不代表普遍能力排名；洞察可以为零。';
@@ -102,7 +114,7 @@ function renderCrossCase(){$('#crossCaseTable tbody').innerHTML=cases.flatMap(c=
 function renderStatic(){const a=DATA.assessment||{},count=DATA.counts||{};document.title=DATA.title||'工程模型综合评测';$('#pageTitle').textContent=DATA.title||'工程模型综合评测';$('#meta').textContent=`${DATA.generated_at||''} · 已有封存材料 · ${models.length} 个模型 · 无跨题质量总分`;
  $('#assessmentConclusion').innerHTML=paragraphs(a.conclusion||'尚未附加分析结论。请依据各题错误、覆盖、表现波动和实际任务取舍，不预设模型排名。');$('#assessmentEvidence').innerHTML=paragraphs(a.evidence?.length?a.evidence:['没有附加人工分析依据；下方保留逐题原始尺度、实际有效数量和性能统计。']);
  $('#metrics').innerHTML=[[count.independent_questions??new Set(cases.map(c=>c.case_id)).size,'独立题目'],[count.scoring_groups??cases.length,'题目 × 细则 × 执行协议'],[count.valid_answers??0,'有效答案'],[count.conditions??0,'批次 × 配置组']].map(([v,l])=>`<div class="metric"><span class="value">${esc(v)}</span><span class="label">${esc(l)}</span></div>`).join('');
- $('#caseSelect').innerHTML=cases.map(c=>`<option value="${esc(c.id)}">${esc(c.label||c.title||c.case_id)} · V${esc(c.scoring_version??'?')} · ${esc(executionLabel(c))} · ${esc(String(c.execution_profile_id||c.rubric_sha256||'').slice(0,8))}</option>`).join('');$('#caseSelect').value=cases[0]?.id||'';const efforts=[...new Set(cases.flatMap(c=>c.conditions||[]).map(g=>g.effort))].sort();$('#effortSelect').innerHTML='<option value="all">全部档位</option>'+efforts.map(e=>`<option value="${esc(e)}">${esc(e)}</option>`).join('');$('#effortSelect').value='all';
+ $('#caseSelect').innerHTML=cases.map(c=>`<option value="${esc(c.id)}">${esc(topicLabel(c))}</option>`).join('');$('#caseSelect').value=cases[0]?.id||'';const efforts=[...new Set(cases.flatMap(c=>c.conditions||[]).map(g=>g.effort))].sort();$('#effortSelect').innerHTML='<option value="all">全部档位</option>'+efforts.map(e=>`<option value="${esc(e)}">${esc(e)}</option>`).join('');$('#effortSelect').value='all';
  $('#modelLegend').innerHTML=models.map(model=>`<span><i class="swatch" style="background:${color({model})}"></i>${esc(model)}</span>`).join('')+'<span>浅色 Standard · 深色 Fast · 小点为单份有效回答</span>';
  const limits=[...new Set(['这是封存记录的离线比较。固定材料模式不衡量工具和委派；工程只读模式允许源码检索、本地验证与原生子代理，不衡量业务代码修改。','题目、评分细则、执行协议和有效样本数有限；质量不跨题或跨细则合并，旧分数保留原尺度，未知维度不推算。','Fast 的样本中位数变化是观测结果；跨批差异不能全归因于速度档。','性能和费用沿用历史采样记录；未知费用不按零处理，重评不等于模型生成行为改变。',...(DATA.limitations||[]),...(a.limitations||[])])];$('#limitations').innerHTML=`<ul class="note-list">${limits.map(t=>`<li>${esc(t)}</li>`).join('')}</ul>`;$('#sources').innerHTML=(DATA.source_batches||[]).map(sourceCard).join('');
  const failures=DATA.failures||[],remote=r=>r.remote_completion===true||r.remote_completion==='completed'?'已完成':r.remote_completion===false?'未完成':'未知';$('#failureSummary').textContent=`计划位置 ${count.planned_slots??'未知'}；记录尝试 ${count.attempts??'未知'}；无效尝试 ${count.invalid_attempts??failures.length}。`;$('#failureTable tbody').innerHTML=failures.length?failures.map(r=>`<tr><td>${esc(r.batch||r.source_batch||'未知')}</td><td>${esc(r.model||'未知')} · ${esc(r.effort||'未知')}</td><td>${esc(r.slot_id||'未知')} · ${esc(r.attempt??'未知')}</td><td>${esc(r.status||'未知')}</td><td>${esc(remote(r))}</td><td>${fmt(r.estimated_api_usd??r.metrics?.estimated_api_usd,4)}</td></tr>`).join(''):'<tr><td colspan="6">没有无效尝试记录。</td></tr>';

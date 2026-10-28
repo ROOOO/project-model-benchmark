@@ -2,7 +2,10 @@
 import contextlib
 import csv
 import io
+import json
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core
 from benchmark import main, parser
 from comparison import compare
+from compact import display_topics
 from evaluation import regrade
 from reporting import blind, build_report, seal
 from test_benchmark import fixture, write_attempt, RATES
@@ -205,6 +209,8 @@ class ComparisonTests(unittest.TestCase):
         with zipfile.ZipFile(archives[0]) as bundle:
             self.assertIn("report.html", bundle.namelist())
             self.assertIn("comparison-data.json", bundle.namelist())
+            for name in ("compact.html", "compact.csv", "compact-data.json"):
+                self.assertIn(name, bundle.namelist())
             for name in bundle.namelist():
                 self.assertEqual(bundle.read(name), (target / name).read_bytes())
         with (target / "conditions.csv").open(encoding="utf-8-sig", newline="") as handle:
@@ -265,6 +271,90 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.output(root, name="bad-assessment", assessment=path)
         self.assertFalse((self.base / "bad-assessment").exists())
+
+    def test_compact_view_preserves_scale_identity_and_partial_coverage(self):
+        root = self.run_fixture("unknown-cost", version=2, repetitions=2, unknown=True)
+        target, data = self.output(root)
+        compact = core.read(target / "compact-data.json")
+        condition = data["cases"][0]["conditions"][0]
+        row = compact["rows"][0]
+        self.assertEqual(compact["condition_count"], 1)
+        self.assertEqual(compact["source_sha256"], core.sha(target / "comparison-data.json"))
+        self.assertEqual(row["condition_id"], condition["id"])
+        self.assertEqual(row["execution_profile_id"], condition["execution_profile_id"])
+        self.assertEqual(row["quality_mean"], condition["statistics"]["quality"]["mean"])
+        self.assertEqual(row["valid_n"], 2)
+        self.assertEqual(row["estimated_api_usd_n"], 0)
+        self.assertIsNone(row["estimated_api_usd_mean"])
+        page = (target / "compact.html").read_text(encoding="utf-8")
+        self.assertIn("准确（50） / 覆盖（20） / 洞察（10） / 表达（20）", page)
+        self.assertIn("— [0/2]", page)
+        self.assertNotIn("(2)", page)
+        with (target / "compact.csv").open(encoding="utf-8", newline="") as f:
+            saved = list(csv.DictReader(f))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["source_id"], row["source_id"])
+        self.assertEqual(saved[0]["estimated_api_usd_n"], "0")
+
+    def test_compact_legacy_missing_dimensions_keep_unknown_scale(self):
+        root = self.run_fixture("legacy-compact")
+        target, _ = self.output(root)
+        compact = core.read(target / "compact-data.json")
+        row = compact["rows"][0]
+        self.assertEqual(row["accuracy_maximum"], 70)
+        self.assertEqual(row["readability_maximum"], 30)
+        self.assertIsNone(row["coverage_maximum"])
+        self.assertIsNone(row["insight_maximum"])
+        page = (target / "compact.html").read_text(encoding="utf-8")
+        self.assertIn("准确（70） / 覆盖（—） / 洞察（—） / 表达（30）", page)
+
+    def test_same_topic_profiles_share_view_without_merging_conditions(self):
+        first = self.run_fixture("profile-a", tiers=["default", "fast"])
+        second = self.run_fixture("profile-b", tiers=["default", "fast"])
+        with patch("comparison.execution_identity", side_effect=[("fixed-evidence", "profile-a"), ("fixed-evidence", "profile-b")]):
+            target, data = self.output(first, second)
+        self.assertEqual(len(data["cases"]), 2)
+        topics = display_topics(data["cases"])
+        self.assertEqual(len(topics), 1)
+        self.assertEqual(len(topics[0]["conditions"]), 4)
+        self.assertEqual(len(topics[0]["member_case_ids"]), 2)
+        self.assertEqual(len(data["paired_speed_observations"]), 2)
+        compact = core.read(target / "compact-data.json")
+        self.assertEqual(compact["topic_count"], 1)
+        self.assertEqual(compact["condition_count"], 4)
+        self.assertEqual({r["execution_profile_id"] for r in compact["rows"]}, {"profile-a", "profile-b"})
+        if shutil.which("node"):
+            checker = Path(__file__).resolve().parents[1] / "check_comparison.cjs"
+            completed = subprocess.run([shutil.which("node"), str(checker), str(target)],
+                                       check=True, capture_output=True, text=True, encoding="utf-8")
+            checked = json.loads(completed.stdout)
+            self.assertEqual(checked["display_topics"], 1)
+            self.assertEqual(checked["compact_conditions"], 4)
+
+    def test_display_topics_do_not_join_rubrics_modes_or_incompatible_scales(self):
+        common = {"case_id": "topic", "rubric_sha256": "gold", "scoring_version": 2,
+                  "execution_mode": "project-readonly", "dimension_maxima": {"accuracy": 50},
+                  "conditions": [], "sources": []}
+        groups = [{**common, "id": "one"}, {**common, "id": "two", "execution_mode": "fixed-evidence"},
+                  {**common, "id": "three", "rubric_sha256": "different"}]
+        self.assertEqual(len(display_topics(groups)), 3)
+        with self.assertRaisesRegex(ValueError, "maxima"):
+            display_topics([groups[0], {**common, "id": "bad", "dimension_maxima": {"accuracy": 70}}])
+
+    def test_same_named_rubrics_have_distinct_selector_labels(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js unavailable")
+        first = self.run_fixture("rubric-a")
+        gold = core.read(self.case / "gold.json")
+        gold["rubric"][0]["criterion"] += "；另一个评分细则版本"
+        core.write(self.case / "gold.json", gold)
+        second = self.run_fixture("rubric-b")
+        target, data = self.output(first, second)
+        self.assertEqual(len(data["cases"]), 2)
+        checker = Path(__file__).resolve().parents[1] / "check_comparison.cjs"
+        checked = subprocess.run([shutil.which("node"), str(checker), str(target)],
+                                 check=True, capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(json.loads(checked.stdout)["display_topics"], 2)
 
 
 if __name__ == "__main__":

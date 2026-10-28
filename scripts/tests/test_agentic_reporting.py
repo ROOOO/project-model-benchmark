@@ -115,6 +115,16 @@ class AgenticReportingTests(unittest.TestCase):
         self.assertEqual(data["counts"]["independent_questions"], 1)
         self.assertEqual({c["execution_mode"] for c in data["cases"]}, {"fixed-evidence", "project-readonly"})
         self.assertEqual(data["paired_speed_observations"], [])
+        compact = core.read(output / "compact-data.json")
+        self.assertEqual(compact["topic_count"], 2)
+        native = next(r for r in compact["rows"] if r["execution_mode"] == "project-readonly")
+        condition = next(c for g in data["cases"] for c in g["conditions"] if c["id"] == native["condition_id"])
+        for metric in ("answer_ready_s", "workflow_elapsed_s", "tree_input_tokens", "tree_output_tokens", "tree_estimated_api_usd"):
+            for field in ("median", "mean", "n"):
+                self.assertEqual(native[metric + "_" + field], condition["statistics"][metric][field])
+        page = (output / "compact.html").read_text(encoding="utf-8")
+        self.assertIn("答案交付（秒）", page)
+        self.assertIn("全部任务结束（秒）", page)
 
     def test_same_snapshot_cross_run_fingerprint_ignores_work_paths(self):
         standard = self.make_run("std")

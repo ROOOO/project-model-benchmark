@@ -12,6 +12,7 @@ from core import (METRICS, check_inputs, check_sensitive, digest,
                   distribution, inside, now, numeric, read, require, scoring_gold,
                   scoring_weights, sha, write)
 from final_tps import ESTIMATE_FIELDS, estimate_final_tps, load_proxy_estimator
+from compact import compact_artifacts
 from reporting import AGENTIC_FLAGS, AGENTIC_METRICS, check_artifact_sensitive, execution_identity, idle, native_evidence_files, runtime_fingerprint, summarize, validate_records
 
 
@@ -392,6 +393,14 @@ def compare(run_dirs, output, models=None, assessment=None, *, estimate_answer_t
                         "Copied task-tree ledger differs from source")
     payload = json.dumps(data, ensure_ascii=False, allow_nan=False).replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
     (output / "report.html").write_text(template.replace("__COMPARISON_DATA__", payload), encoding="utf-8")
+    cli_versions = {}
+    for source in data["source_batches"]:
+        runtime = output / "sources" / source["id"] / "runtime.json"
+        if runtime.is_file():
+            cli_versions[source["id"]] = read(runtime).get("fingerprint", {}).get("version")
+    compact = compact_artifacts(data, sha(output / "comparison-data.json"), cli_versions)
+    for name, content in compact.items():
+        (output / name).write_text(content, encoding="utf-8", newline="")
     after = {str(p): fingerprint(p) for p in roots}
     write(output / "source-manifest-after.json", after)
     require(before == after, "Source file set or hashes changed during comparison")
@@ -400,8 +409,11 @@ def compare(run_dirs, output, models=None, assessment=None, *, estimate_answer_t
     for name, content in export_tables(data).items():
         require((output / name).read_bytes() == content.encode("utf-8"), "Comparison CSV differs after export")
     require(payload in (output / "report.html").read_text(encoding="utf-8"), "Comparison HTML data differs after export")
+    for name, content in compact.items():
+        require((output / name).read_bytes() == content.encode("utf-8"), "Compact view differs after export")
     validation = {"ok": True, "source_files_unchanged": True, "json_csv_consistent": True,
                   "html_embedded_data_consistent": True, "portable_answer_hashes_verified": len(data["samples"]),
+                  "compact_view_consistent": True,
                   "counts": data["counts"], "no_new_model_sampling": True,
                   "layout_check": "Not run by Python exporter; use check_comparison.cjs and record any visual review separately.",
                   "archive_bytes_verified": True}

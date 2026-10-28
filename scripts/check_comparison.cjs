@@ -21,7 +21,7 @@ ok(!/<script[^>]+src\s*=/i.test(html), 'external executable resource');
 ok(!/<(?:img|iframe|link)[^>]+(?:src|href)\s*=\s*["']https?:/i.test(html), 'external rendering resource');
 ok(!/\bon(?:click|error|load)\s*=/i.test(html), 'inline event handler');
 ok(html.includes('@media(max-width:560px)') && html.includes('overflow:auto'), 'responsive fallback missing');
-for (const name of ['comparison-data.json', 'grading-details.json', 'conditions.csv', 'samples.csv', 'fast-observations.csv',
+for (const name of ['compact.html', 'comparison-data.json', 'grading-details.json', 'conditions.csv', 'samples.csv', 'fast-observations.csv',
                     'manifest.json', 'validation.json', 'comparison.zip']) {
   ok(html.includes('href="' + name + '"'), 'missing download: ' + name);
 }
@@ -69,7 +69,22 @@ for (const source of data.source_batches || []) {
   }
 }
 const finite = x => typeof x === 'number' && Number.isFinite(x);
-const cases = data.cases || [];
+// Build the expected display groups independently from the page implementation.
+const topics = new Map();
+for (const group of data.cases || []) {
+  const key = JSON.stringify([group.case_id, group.rubric_sha256, group.scoring_version, group.execution_mode]);
+  if (!topics.has(key)) topics.set(key, { ...group, id: `topic-${topics.size + 1}`, conditions: [], member_case_ids: [], sources: [] });
+  const topic = topics.get(key);
+  eq(topic.dimension_maxima || topic.weights, group.dimension_maxima || group.weights, 'topic score scale mismatch');
+  topic.conditions.push(...(group.conditions || []));
+  topic.member_case_ids.push(group.id);
+  for (const source of group.sources || []) if (!topic.sources.some(s => s.id === source.id)) topic.sources.push(source);
+}
+const cases = [...topics.values()];
+eq(vm.runInContext('cases.length', ctx), cases.length, 'all matching profiles must share the topic view');
+eq((node('#caseSelect').innerHTML.match(/<option /g) || []).length, cases.length, 'topic selector options');
+const topicLabels = cases.map((_, index) => vm.runInContext(`topicLabel(cases[${index}])`, ctx));
+eq(new Set(topicLabels).size, cases.length, 'topic selector labels must distinguish different rubrics');
 const dimensions = ['accuracy', 'coverage', 'readability', 'insight'];
 const countRows = markup => (markup.match(/<tr>/g) || []).length;
 eq(node('#caseSelect').value, cases[0]?.id || '');
@@ -127,7 +142,7 @@ for (const c of cases) for (const effort of efforts) for (const sort of ['config
     ok(markup.includes('viewBox="0 0 '), chart + ' scalable SVG');
   }
   const conditionIds = new Set(groups.map(g => g.id));
-  const pairs = (data.paired_speed_observations || []).filter(p => p.case === c.id &&
+  const pairs = (data.paired_speed_observations || []).filter(p => c.member_case_ids.includes(p.case) &&
     conditionIds.has(p.standard_condition) && conditionIds.has(p.fast_condition));
   eq(countRows(node('#fastTable').innerHTML), pairs.length ? pairs.length + 1 : 0, 'explicit Fast pairs only');
   if (pairs.some(p => p.kind === 'historical-observation'))
@@ -135,10 +150,32 @@ for (const c of cases) for (const effort of efforts) for (const sort of ['config
   if (pairs.some(p => p.kind === 'same-batch'))
     ok(node('#fastTable').innerHTML.includes('同批观察'), 'same-batch label missing');
 }
+const compact = JSON.parse(fs.readFileSync(path.join(root, 'compact-data.json'), 'utf8'));
+const compactHtml = fs.readFileSync(path.join(root, 'compact.html'), 'utf8');
+const sourceConditions = new Map((data.cases || []).flatMap(c => (c.conditions || []).map(g => [g.id, g])));
+eq(compact.condition_count, sourceConditions.size, 'compact condition count');
+eq(compact.topic_count, cases.length, 'compact topic count');
+eq(new Set(compact.rows.map(r => r.condition_id)).size, sourceConditions.size, 'compact duplicate or missing condition');
+eq((compactHtml.match(/data-condition=/g) || []).length, sourceConditions.size, 'compact HTML row count');
+ok(compactHtml.includes('href="report.html"'), 'compact full-report link');
+ok(!/<script\b/i.test(compactHtml), 'compact static view must not execute scripts');
+for (const row of compact.rows) {
+  const g = sourceConditions.get(row.condition_id);
+  ok(g, 'unknown compact condition');
+  eq(row.case, g.case, 'compact original case identity');
+  eq(row.execution_profile_id, g.execution_profile_id, 'compact original profile');
+  eq(row.valid_n, g.valid_completed, 'compact actual n');
+  eq(row.planned_n, g.planned, 'compact planned n');
+  for (const [key, expected] of Object.entries(g.statistics || {})) for (const field of ['n', 'mean', 'median', 'min', 'max']) {
+    if (Object.hasOwn(row, `${key}_${field}`)) eq(row[`${key}_${field}`], expected[field], 'compact metric differs');
+  }
+  ok(compactHtml.includes(`data-condition="${escaped(row.condition_id)}"`), 'compact identity absent from HTML');
+}
 for (const [selector, item] of nodes) {
   ok(!/javascript\s*:|<script[^>]*>/.test(item.innerHTML), 'unsafe generated markup in ' + selector);
 }
 console.log(JSON.stringify({ status: 'passed', counted_assertions: checks,
-  filter_combinations: combinations, offline_stub_dom: true, real_browser: false,
+  filter_combinations: combinations, display_topics: cases.length, compact_conditions: compact.condition_count,
+  offline_stub_dom: true, real_browser: false,
   source_data_deep_equal: true,
   limits: ['Runs page JavaScript with a minimal DOM and checks generated markup; does not verify browser CSS layout, rendering or assistive technology.'] }));
