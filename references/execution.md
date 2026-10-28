@@ -11,11 +11,19 @@ benchmark.py discover --project <explicit-root>
 benchmark.py discover --current <current-working-directory>
 benchmark.py discover --no-current --projects-json <projects.json> --threads-json <threads.json> --output <selection.json>
 benchmark.py history
+benchmark.py inventory --root <benchmarks>
+benchmark.py inventory --run-dirs <batch-a> <batch-b>
 ```
 
 `projects.json` 接受项目工具返回的 `{projects:[...]}`，字段使用 `projectId / projectKind / hostId / label / path`；`threads.json` 为 `{pinnedThreads:[...],threads:[...]}`，只需 `id / projectId / hostId / updatedAt`。也接受包含 text JSON 的 MCP 返回包装。将 workspace 记录转换为同一最小项目格式即可复用排序；没有任务数据时按路径稳定排序，并明确没有使用频次证据。远端与云项目不参与本机回退。
 
 `discover` 返回入口工程，不解析业务规则语义；代理仍须读取它的 AGENTS 和 workspace 映射，确定实际源码仓后写入 case。
+
+`history` 递归发现嵌套批次，仍只返回题目、工程、case ID 和创建时间。`inventory` 默认扫描 benchmark 根，也可用互斥的 `--root` 或 `--run-dirs` 限定范围；后者只读取列出的精确批次。自动发现遇到批次即停止向内，跳过比较报告及内部副本目录，不跟随链接或 Windows 联接。
+
+清单只读 protocol 和执行收据，从计划与实际尝试推导每个模型×档位×速度的计划、已开始、选中有效、失败／中断尝试和未开始数；不打开独立答案、评分或匿名映射文件，不返回质量信息，也不调用模型。能力验收不计入正式采样。损坏或读取期间变化的执行记录保留诊断和未知覆盖，不能当作零。
+
+报告、评分封存、锁和 inflight 字段仅表示记录存在，不代表报告已验证或进程仍活跃。重评和 parent 来源关系原样列出，不自动合并或替使用者选择评分版本。清单用于确认续测／比较范围；真正续跑前仍按进程与持久记录核实状态。
 
 ## Case bundle
 

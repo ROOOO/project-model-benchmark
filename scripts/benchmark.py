@@ -9,6 +9,7 @@ import sys
 
 from core import BenchmarkError, EFFORTS, MODELS, check_inputs, home, prepare, read, require, require_sampling_allowed, select_project, write
 from evaluation import regrade
+from inventory import history as topic_history, inventory
 from comparison import compare
 from reporting import archive, blind, build_report, seal, validate
 from runtime import Server, execute, capability_smoke
@@ -41,6 +42,10 @@ def parser():
     discover.add_argument("--output")
     history = sub.add_parser("history", help="List prior topics without answer/quality data")
     history.add_argument("--root", default=str(home() / "benchmarks"))
+    listing = sub.add_parser("inventory", help="Read execution coverage of existing batches; no inference or quality data")
+    scope = listing.add_mutually_exclusive_group()
+    scope.add_argument("--root", help="Scan nested batches; defaults to the benchmark root")
+    scope.add_argument("--run-dirs", nargs="+", help="Inspect only these exact batch roots")
     revision = sub.add_parser("regrade", help="Prepare an isolated offline scoring revision; never starts inference")
     revision.add_argument("--run-dir", required=True)
     revision.add_argument("--rubric", required=True)
@@ -95,7 +100,9 @@ def main(argv=None):
         if args.output:
             write(args.output, value)
     elif args.command == "history":
-        value = [{k: p.get(k) for k in ["title", "project", "case_id", "created_at"]} for f in sorted(Path(args.root).glob("*/protocol.json")) if (p := read(f))]
+        value = topic_history(args.root)
+    elif args.command == "inventory":
+        value = inventory(root=args.root, run_dirs=args.run_dirs)
     elif args.command == "regrade":
         value = regrade(args.run_dir, args.rubric, args.output, repair_final_answers=args.repair_final_answers)
     elif args.command == "compare":
