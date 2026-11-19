@@ -129,6 +129,27 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(condition["statistics"]["estimated_api_usd"]["n"], 0)
         self.assertIsNone(condition["statistics"]["estimated_api_usd"]["mean"])
 
+    def test_default_subscription_price_is_separate_from_frozen_api_price(self):
+        root = self.run_fixture("subscription", tiers=["default", "fast"])
+        before = snapshot(root)
+        target, data = self.output(root)
+        rows = {r["service_tier"]: r for r in data["samples"]}
+        self.assertAlmostEqual(rows["default"]["estimated_subscription_credits"], 0.07025)
+        self.assertAlmostEqual(rows["priority"]["estimated_subscription_credits"], 0.175625)
+        self.assertAlmostEqual(rows["default"]["estimated_subscription_usd"], 0.00281)
+        self.assertAlmostEqual(rows["priority"]["estimated_subscription_usd"], 0.007025)
+        self.assertAlmostEqual(rows["priority"]["estimated_api_usd"] / rows["default"]["estimated_api_usd"], 2)
+        self.assertEqual(data["billing_context"]["speed_multipliers"]["priority"], 2.5)
+        self.assertEqual(data["billing_context"]["unit"], "USD")
+        self.assertEqual(data["billing_context"]["usd_equivalent"]["credits_per_usd"], 25)
+        self.assertEqual(snapshot(root), before)
+        page = (target / "compact.html").read_text(encoding="utf-8")
+        self.assertIn("$0.0070", page)
+        self.assertNotIn("API 美元均值", page)
+        self.assertIn("估算费用（美元）", page)
+        self.assertNotIn("／答", page)
+        self.assertNotIn("/答", page)
+
     def test_regrade_duplicate_original_attempt_rejected(self):
         root = self.run_fixture("original")
         rubric = self.base / "new-rubric.json"

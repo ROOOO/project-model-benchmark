@@ -19,6 +19,7 @@ import zipfile
 
 from core import DIMENSION_LABELS, METRICS, all_attempts, check_inputs, check_sensitive, chosen_attempts, digest, distribution, inside, metric_keys, metrics_for_protocol, now, price_for, protocol_tiers, read, require, scoring_gold, scoring_weights, sha, usage_issues, validate_scores, write
 from runtime import still_running
+from billing import SUBSCRIPTION_LABEL, SUBSCRIPTION_METRICS, billing_context, format_usd, subscription_export, subscription_view
 
 
 CSV_FIELDS = list(dict.fromkeys(["slot_id", "attempt", "model", "effort", "repetition", "status", "valid", "selected", "accuracy", "readability", "quality", "anonymous_id", "actual_gateway_charge", *METRICS, "answer_link"]))
@@ -556,7 +557,7 @@ def fmt(x, digits=2):
 def condition_table(cells, weights=None):
     if weights is None:
         weights = {"accuracy": 50, "coverage": 20, "insight": 10, "readability": 20} if cells and "coverage" in cells[0]["statistics"] else {"accuracy": 70, "readability": 30}
-    heads = ["组合", "有效/计划", "尝试/失败", *[DIMENSION_LABELS[k] + " /" + str(v) for k, v in weights.items()], "总分 /100", "耗时中位 s", "TTFT 中位 s", "可见 TPS 中位", "输出 token 均值", "费用均值 USD"]
+    heads = ["组合", "有效/计划", "尝试/失败", *[DIMENSION_LABELS[k] + " /" + str(v) for k, v in weights.items()], "总分 /100", "耗时中位 s", "TTFT 中位 s", "可见 TPS 中位", "输出 token 均值", SUBSCRIPTION_LABEL]
     if "coverage" in weights:
         heads += ["关键错误数", "有错误/遗漏答案数"]
     if cells and "service_tier" in cells[0]:
@@ -564,8 +565,7 @@ def condition_table(cells, weights=None):
     body = []
     for c in cells:
         s = c["statistics"]
-        cost_key = "estimated_api_usd" if "service_tier" in c else "estimated_standard_api_usd"
-        values = [html.escape(condition_label(c)), f"{c['valid_completed']}/{c['planned']}", f"{c['attempts']}/{c['failed_attempts']}", *[fmt(s[k]["mean"]) for k in list(weights) + ["quality"]], *[fmt(s[k]["median"]) for k in ["elapsed_s", "ttft_visible_s", "visible_decode_tps"]], fmt(s["output_tokens"]["mean"], 0), fmt(s[cost_key]["mean"], 6)]
+        values = [html.escape(condition_label(c)), f"{c['valid_completed']}/{c['planned']}", f"{c['attempts']}/{c['failed_attempts']}", *[fmt(s[k]["mean"]) for k in list(weights) + ["quality"]], *[fmt(s[k]["median"]) for k in ["elapsed_s", "ttft_visible_s", "visible_decode_tps"]], fmt(s["output_tokens"]["mean"], 0), format_usd(s.get("estimated_subscription_usd", {}).get("mean"))]
         if "coverage" in weights:
             values += [str(c.get("critical_errors", 0)), f"{c.get('error_answers', 0)}/{c.get('omission_answers', 0)}"]
         if "service_tier" in c:
@@ -582,6 +582,8 @@ def render_csv(rows, version=1, service_tiers=None):
         fields = fields[:4] + ["service_tier", "speed_mode"] + fields[4:]
     if any("accounting_complete" in row for row in rows):
         fields = list(dict.fromkeys([*fields, *AGENTIC_METRICS, *AGENTIC_FLAGS]))
+    if any("estimated_subscription_credits" in row for row in rows):
+        fields = list(dict.fromkeys([*fields, *SUBSCRIPTION_METRICS, "billing_basis", "billing_unit", "billing_rules_as_of"]))
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
     writer.writerows(rows)
@@ -592,14 +594,15 @@ def tier_comparison_html(data):
     pairs = data.get("tier_comparisons", [])
     if not pairs:
         return ""
-    labels = {"quality": "总分", "elapsed_s": "耗时 s", "ttft_visible_s": "TTFT s", "visible_decode_tps": "可见 TPS", "output_tokens": "输出 token", "estimated_api_usd": "费用 USD"}
+    labels = {"quality": "总分", "elapsed_s": "耗时 s", "ttft_visible_s": "TTFT s", "visible_decode_tps": "可见 TPS", "output_tokens": "输出 token", "estimated_subscription_usd": SUBSCRIPTION_LABEL}
     rows = []
     for pair in pairs:
         for key, label in labels.items():
-            metric = pair["metrics"][key]
-            values = [condition_label(pair), label, str(metric["default"]["n"]), fmt(metric["default"]["median"], 6 if key == "estimated_api_usd" else 2),
-                      str(metric["priority"]["n"]), fmt(metric["priority"]["median"], 6 if key == "estimated_api_usd" else 2),
-                      fmt(metric["fast_minus_standard"], 6 if key == "estimated_api_usd" else 2), fmt(metric["fast_over_standard"])]
+            metric = pair["metrics"].get(key, {"default": {"n": 0, "median": None}, "priority": {"n": 0, "median": None}, "fast_minus_standard": None, "fast_over_standard": None})
+            formatter = format_usd if key == "estimated_subscription_usd" else fmt
+            values = [condition_label(pair), label, str(metric["default"]["n"]), formatter(metric["default"]["median"]),
+                      str(metric["priority"]["n"]), formatter(metric["priority"]["median"]),
+                      formatter(metric["fast_minus_standard"]), fmt(metric["fast_over_standard"])]
             rows.append("<tr>" + "".join("<td>" + html.escape(v) + "</td>" for v in values) + "</tr>")
     heads = ["模型 / 思考强度", "指标", "Standard n", "Standard 中位数", "Fast n", "Fast 中位数", "Fast − Standard", "Fast / Standard"]
     return '<section><h2>同模型同思考强度：Standard / Fast</h2><p class="note">比较各组中位数，分别展示实际 n；不是按轮次配对的因果估计。缺值或 Standard 中位数为零时，倍率为 —。</p><div class="tablewrap"><table><thead><tr>' + "".join("<th>" + x + "</th>" for x in heads) + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div></section>"
@@ -609,7 +612,7 @@ def agentic_html(data):
     if data.get("execution_mode") != "project-readonly":
         return ""
     heads = ["组合", "委派答案/已观测", "子代理数中位", "答案就绪 s", "全任务 s", "首次进度 s", "正文首字 s",
-             "主/子/全树输出 token 中位", "根/全树端到端输出 token/s 中位", "主/子/全树费用均值 USD", "计量完整尝试", "已观测费用合计 USD"]
+             "主/子/全树输出 token 中位", "根/全树端到端输出 token/s 中位", SUBSCRIPTION_LABEL, "计量完整尝试"]
     rows = []
     for cell in data["conditions"]:
         stats = cell["statistics"]
@@ -618,9 +621,8 @@ def agentic_html(data):
                   median("delegation_count"), *[median(k) for k in ("answer_ready_s", "workflow_elapsed_s", "first_progress_s", "final_ttft_s")],
                   " / ".join(fmt(stats.get(p + "output_tokens", {}).get("median"), 0) for p in ("root_", "child_", "tree_")),
                   " / ".join(median(k) for k in ("root_output_e2e_tps", "tree_output_e2e_tps")),
-                  " / ".join(fmt(stats.get(p + "estimated_api_usd", {}).get("mean"), 6) for p in ("root_", "child_", "tree_")),
-                  f"{cell['accounting_complete_attempts']}/{cell['attempts']}",
-                  fmt(cell["known_observed_cost_usd"] if cell["observed_cost_coverage_attempts"] else None, 6)]
+                  format_usd(stats.get("estimated_subscription_usd", {}).get("mean")),
+                  f"{cell['accounting_complete_attempts']}/{cell['attempts']}"]
         rows.append("<tr>" + "".join("<td>" + html.escape(v) + "</td>" for v in values) + "</tr>")
     capability = data.get("capability_verification")
     note = ""
@@ -636,6 +638,8 @@ def report_context(root):
     root = Path(root)
     assessment = read(root / "assessment.json") if (root / "assessment.json").exists() else {"conclusion": "尚未填写本题的模型选择建议。请结合下表、事实错误与答案阅读质量评估。", "evidence": [], "limitations": []}
     return {"protocol": read(root / "protocol.json"), "prices": read(root / "prices.json"), "assessment": assessment,
+            "records": all_attempts(root),
+            "billing_context": billing_context(),
             "parent": read(root / "parent-summary.json") if (root / "parent-summary.json").exists() else None,
             "fingerprint": read(root / "runtime.json").get("fingerprint") if (root / "runtime.json").exists() else None,
             "prompt": (root / "input/prompt.txt").read_text(encoding="utf-8"), "gold": read(root / "input/gold.json"), "scoring_gold": scoring_gold(root)}
@@ -687,13 +691,17 @@ def evaluation_html(data, context):
 
 def render_html(data, context):
     """Render only supplied data; file and clock access belongs to the caller."""
+    data = subscription_view(data, context.get("records", []), context.get("billing_context"))
     p, prices, assessment = context["protocol"], context["prices"], context["assessment"]
     require(isinstance(assessment.get("conclusion"), str) and isinstance(assessment.get("evidence", []), list) and isinstance(assessment.get("limitations", []), list), "Invalid assessment format")
     check_sensitive(json.dumps(assessment, ensure_ascii=False))
     detail = []
     for c in data["conditions"]:
         for name, stat in c["statistics"].items():
-            detail.append("<tr>" + "".join("<td>"+html.escape(str(v))+"</td>" for v in [condition_label(c, "/"), name, stat["n"], *[fmt(stat[k], 6) for k in ["mean", "median", "sd", "min", "max"]]]) + "</tr>")
+            if (("usd" in name or name in SUBSCRIPTION_METRICS) and name != "estimated_subscription_usd") or name == "estimated_codex_credits":
+                continue
+            formatter = format_usd if name == "estimated_subscription_usd" else fmt
+            detail.append("<tr>" + "".join("<td>"+html.escape(str(v))+"</td>" for v in [condition_label(c, "/"), SUBSCRIPTION_LABEL if name == "estimated_subscription_usd" else name, stat["n"], *[formatter(stat[k], 6) for k in ["mean", "median", "sd", "min", "max"]]]) + "</tr>")
     comparison = ""
     if context["parent"] is not None:
         parent = context["parent"]
@@ -717,7 +725,10 @@ def render_html(data, context):
     const d=JSON.parse(document.getElementById('data').textContent);for(const side of ['left','right']){const s=document.getElementById(side);d.answers.forEach((a,i)=>{const o=document.createElement('option');o.value=i;o.textContent=a.label;s.append(o)});s.selectedIndex=side==='right'&&d.answers.length>1?1:0;function show(){document.getElementById(side+'-answer').innerHTML=d.answers[s.value]?.html||'无答案'}s.addEventListener('change',show);show()}
     const ns='http://www.w3.org/2000/svg',svg=document.createElementNS(ns,'svg');svg.setAttribute('viewBox',`0 0 1050 ${d.cells.length*42+42}`);svg.setAttribute('role','img');svg.setAttribute('aria-label','各组合耗时中位数与最小最大范围');const max=Math.max(1,...d.cells.map(c=>c.statistics.elapsed_s.max||0));function el(tag,attrs,text){const n=document.createElementNS(ns,tag);Object.entries(attrs).forEach(([k,v])=>n.setAttribute(k,v));if(text)n.textContent=text;svg.append(n)}d.cells.forEach((c,i)=>{const y=i*42+25,s=c.statistics.elapsed_s,x=v=>265+(v||0)/max*670;el('text',{x:0,y},c.model+'/'+c.effort);if(s.n){el('line',{x1:x(s.min),x2:x(s.max),y1:y-5,y2:y-5,stroke:'#57979b','stroke-width':3});el('circle',{cx:x(s.median),cy:y-5,r:5,fill:'#bd702b'});el('text',{x:950,y},s.median.toFixed(1)+' s')}});document.getElementById('chart').append(svg);
     </script></body></html>'''
-    values = {"TITLE": html.escape(data["title"]), "BATCH": html.escape(data["batch"]), "PROJECT": html.escape(data["project"].get("name", data["project"]["root"])), "VALID": str(data["valid_completed"]), "PLANNED": str(data["planned"]), "ATTEMPTS": str(data["attempt_count"]), "STATUS": ("全量成功" if data["scores_sealed"] else "采样完成，评分未封存") if data["all_planned_successful"] else "有失败或缺口", "CONCLUSION": html.escape(assessment["conclusion"]), "EVIDENCE": evidence, "TABLE": condition_table(data["conditions"]), "TIME": fmt(data["observed_total_elapsed_s"]), "COST": fmt(data["known_cost_usd"] if data["cost_coverage_attempts"] else None, 6), "COVERAGE": str(data["cost_coverage_attempts"]), "PRICE_DATE": html.escape(str(prices.get("as_of") or "未知")), "PARENT": comparison, "DETAIL": "".join(detail), "PROMPT": markdown(context["prompt"]), "GOLD": html.escape(json.dumps(context["gold"], ensure_ascii=False, indent=2)), "HASHES": html.escape(json.dumps(p["input_hashes"], indent=2)), "RAW": raw, "LIMITS": limit_html, "PRICES": html.escape(json.dumps(prices, ensure_ascii=False, indent=2)), "DATA": payload}
+    page = page.replace('已知费用合计 $@@COST@@，覆盖 @@COVERAGE@@ 次尝试。价格日期 @@PRICE_DATE@@。', '估算费用合计 @@COST@@，覆盖 @@COVERAGE@@ 次尝试。规则核对日期 @@PRICE_DATE@@。')
+    page = page.replace('<h2>本批次结果</h2>', '<h2>本批次结果</h2><p class="note">' + html.escape(data["billing_context"]["note"]) + '</p>')
+    page = page.replace('<a href="summary.json">完整 JSON</a>', '<a href="summary.json">历史原始 JSON</a> · <a href="subscription-prices.json">订阅估算 JSON</a>')
+    values = {"TITLE": html.escape(data["title"]), "BATCH": html.escape(data["batch"]), "PROJECT": html.escape(data["project"].get("name", data["project"]["root"])), "VALID": str(data["valid_completed"]), "PLANNED": str(data["planned"]), "ATTEMPTS": str(data["attempt_count"]), "STATUS": ("全量成功" if data["scores_sealed"] else "采样完成，评分未封存") if data["all_planned_successful"] else "有失败或缺口", "CONCLUSION": html.escape(assessment["conclusion"]), "EVIDENCE": evidence, "TABLE": condition_table(data["conditions"]), "TIME": fmt(data["observed_total_elapsed_s"]), "COST": format_usd(data["known_subscription_usd"]), "COVERAGE": str(data["subscription_usd_coverage_attempts"]), "PRICE_DATE": html.escape(data["billing_context"]["as_of"]), "PARENT": comparison, "DETAIL": "".join(detail), "PROMPT": markdown(context["prompt"]), "GOLD": html.escape(json.dumps(context["gold"], ensure_ascii=False, indent=2)), "HASHES": html.escape(json.dumps(p["input_hashes"], indent=2)), "RAW": raw, "LIMITS": limit_html, "PRICES": html.escape(json.dumps(prices, ensure_ascii=False, indent=2)), "DATA": payload}
     intro, old_evaluation, audit = evaluation_html(data, context)
     values["TABLE"] = intro + values["TABLE"] + audit + agentic_html(data)
     values["PARENT"] += old_evaluation
@@ -742,9 +753,12 @@ def build_report(root, partial=False):
     root = Path(root)
     idle(root)
     data = summarize(root, partial)
-    page = render_html(data, report_context(root))
-    table = render_csv(data["rows"], data.get("scoring_version", 1), data.get("service_tiers"))
+    context = report_context(root)
+    view = subscription_view(data, context["records"], context["billing_context"])
+    page = render_html(data, context)
+    table = render_csv(view["rows"], data.get("scoring_version", 1), data.get("service_tiers"))
     write(root / "summary.json", data)
+    write(root / "subscription-prices.json", subscription_export(view))
     (root / "metrics.csv").write_text(table, encoding="utf-8-sig", newline="")
     (root / "report.html").write_text(page, encoding="utf-8")
     return data
@@ -853,10 +867,13 @@ def validate(root, partial=False, *, write_receipt=False):
         require(isinstance(actual, dict) and {k: v for k, v in actual.items() if k != "generated_at"} == {k: v for k, v in expected.items() if k != "generated_at"}, "Summary differs from raw results")
         with (root / "metrics.csv").open(encoding="utf-8-sig", newline="") as f:
             csv_rows = list(csv.reader(f))
-        expected_csv = list(csv.reader(io.StringIO(render_csv(expected["rows"], expected.get("scoring_version", 1), expected.get("service_tiers")), newline="")))
+        context = report_context(root)
+        view = subscription_view(expected, context["records"], context["billing_context"])
+        expected_csv = list(csv.reader(io.StringIO(render_csv(view["rows"], expected.get("scoring_version", 1), expected.get("service_tiers")), newline="")))
         require(csv_rows == expected_csv, "CSV differs from raw results: headers or rows")
+        require(read(root / "subscription-prices.json") == subscription_export(view), "Subscription estimate differs from raw results")
         page = (root / "report.html").read_text(encoding="utf-8")
-        require(page == render_html(expected, report_context(root)), "HTML differs from raw results; regenerate with report")
+        require(page == render_html(expected, context), "HTML differs from raw results; regenerate with report")
         parser = Links()
         parser.feed(page)
         require(len(parser.ids) == len(set(parser.ids)), "Duplicate HTML IDs")
@@ -883,7 +900,7 @@ def archive(root):
     if execution_identity(check_inputs(root))[0] == "project-readonly":
         capability_summary(root)
     files = []
-    names = ["protocol.json", "prices.json", "runtime.json", "preflight.json", "instruction-context.json", "preparation-seal.json", "progress.json", "assessment.json", "summary.json", "metrics.csv", "report.html", "validation.json", "ui-check.json", "parent-summary.json", "permission-probe.json", "permission-probe-seal.json"]
+    names = ["protocol.json", "prices.json", "runtime.json", "preflight.json", "instruction-context.json", "preparation-seal.json", "progress.json", "assessment.json", "summary.json", "subscription-prices.json", "metrics.csv", "report.html", "validation.json", "ui-check.json", "parent-summary.json", "permission-probe.json", "permission-probe-seal.json"]
     files.extend(root / n for n in names if (root / n).is_file())
     files.extend(p for p in (root / "input").rglob("*") if p.is_file())
     if check_inputs(root).get("offline_regrade"):

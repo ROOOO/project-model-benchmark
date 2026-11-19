@@ -14,6 +14,18 @@ const eq = (a, b, message) => { assert.deepEqual(a, b, message); checks++; };
 const match = html.match(/<script[^>]*id="comparison-data"[^>]*>([\s\S]*?)<\/script>/);
 ok(match, 'embedded data missing');
 eq(JSON.parse(match[1]), data, 'embedded data differs from export');
+eq(data.billing_context?.unit, 'USD', 'default price unit');
+eq(data.billing_context?.speed_multipliers?.priority, 2.5, 'subscription Fast multiplier');
+eq(data.billing_context?.usd_equivalent?.credits_per_usd, 25, 'dollar normalization');
+ok(!/<th[^>]*>[^<]*(?:credits|API|[／/]答)[^<]*<\/th>/i.test(html), 'table must show only dollar price without an answer suffix');
+const priceHead = html.match(/<table id="costTable">[\s\S]*?<\/thead>/)?.[0] || '';
+eq((priceHead.match(/<th>/g) || []).length, 3, 'single final price column plus identity and coverage');
+ok(priceHead.includes('<th>估算费用（美元）</th>'), 'price heading');
+for (const sample of data.samples || []) {
+  if (typeof sample.estimated_subscription_credits === 'number')
+    eq(sample.estimated_subscription_usd, sample.estimated_subscription_credits / 25, 'sample dollar amount must be converted');
+  else eq(sample.estimated_subscription_usd, null, 'unknown credits cannot become a dollar price');
+}
 const executable = [...html.matchAll(/<script([^>]*)>([\s\S]*?)<\/script>/g)]
   .filter(m => !m[1].includes('application/json'));
 eq(executable.length, 1);
@@ -125,7 +137,7 @@ for (const c of cases) for (const effort of efforts) for (const sort of ['config
   for (const [chart, key, center] of [
     ['elapsedChart', 'elapsed_s', 'median'], ['ttftChart', 'ttft_visible_s', 'median'],
     ['tpsChart', 'visible_decode_tps', 'median'], ['outputChart', 'output_tokens', 'median'],
-    ['costChart', 'estimated_api_usd', 'mean'], ['answerReadyChart', 'answer_ready_s', 'median'],
+    ['costChart', 'estimated_subscription_usd', 'mean'], ['answerReadyChart', 'answer_ready_s', 'median'],
     ['finalTtftChart', 'final_ttft_s', 'median'], ['progressChart', 'first_progress_s', 'median'],
     ['rootThroughputChart', 'root_output_e2e_tps', 'median'], ['agentCountChart', 'delegation_count', 'median']
   ]) {
@@ -134,6 +146,7 @@ for (const c of cases) for (const effort of efforts) for (const sort of ['config
     ok(!/(?:NaN|Infinity|undefined)(?:[<" ]|$)/.test(markup), chart + ' non-finite output');
     eq((markup.match(/<svg /g) || []).length, available.length ? 1 : 0, chart + ' availability');
     if (!available.length) continue;
+    if (chart === 'costChart') ok(markup.includes('$'), 'dollar prefix missing from price chart');
     ok(markup.includes(center === 'mean' ? '均值' : '中位数'), chart + ' statistic label');
     eq((markup.match(/class="center"/g) || []).length, available.length, chart + ' center dots');
     eq((markup.match(/class="sample"/g) || []).length,
@@ -142,6 +155,10 @@ for (const c of cases) for (const effort of efforts) for (const sort of ['config
     ok(markup.includes('viewBox="0 0 '), chart + ' scalable SVG');
   }
   const conditionIds = new Set(groups.map(g => g.id));
+  for (const g of groups) {
+    const amount = g.statistics?.estimated_subscription_usd?.mean;
+    if (finite(amount)) ok(node('#costTable tbody').innerHTML.includes('$' + amount.toFixed(4)), 'dollar amount missing from price table');
+  }
   const pairs = (data.paired_speed_observations || []).filter(p => c.member_case_ids.includes(p.case) &&
     conditionIds.has(p.standard_condition) && conditionIds.has(p.fast_condition));
   eq(countRows(node('#fastTable').innerHTML), pairs.length ? pairs.length + 1 : 0, 'explicit Fast pairs only');
@@ -159,6 +176,8 @@ eq(new Set(compact.rows.map(r => r.condition_id)).size, sourceConditions.size, '
 eq((compactHtml.match(/data-condition=/g) || []).length, sourceConditions.size, 'compact HTML row count');
 ok(compactHtml.includes('href="report.html"'), 'compact full-report link');
 ok(!/<script\b/i.test(compactHtml), 'compact static view must not execute scripts');
+ok(compactHtml.includes('<th scope="col">估算费用（美元）</th>'), 'compact dollar heading');
+ok(!/<th[^>]*>[^<]*(?:credits|API|[／/]答)[^<]*<\/th>/i.test(compactHtml), 'compact second price or answer suffix');
 for (const row of compact.rows) {
   const g = sourceConditions.get(row.condition_id);
   ok(g, 'unknown compact condition');
@@ -166,6 +185,9 @@ for (const row of compact.rows) {
   eq(row.execution_profile_id, g.execution_profile_id, 'compact original profile');
   eq(row.valid_n, g.valid_completed, 'compact actual n');
   eq(row.planned_n, g.planned, 'compact planned n');
+  eq(row.billing_unit, 'USD', 'compact currency');
+  if (finite(row.estimated_subscription_usd_mean))
+    ok(compactHtml.includes('$' + row.estimated_subscription_usd_mean.toFixed(4)), 'compact dollar prefix or amount');
   for (const [key, expected] of Object.entries(g.statistics || {})) for (const field of ['n', 'mean', 'median', 'min', 'max']) {
     if (Object.hasOwn(row, `${key}_${field}`)) eq(row[`${key}_${field}`], expected[field], 'compact metric differs');
   }

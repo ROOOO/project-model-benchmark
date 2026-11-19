@@ -7,6 +7,7 @@ import io
 import json
 
 from core import require
+from billing import SUBSCRIPTION_LABEL, format_usd
 
 
 DIMENSIONS = (("accuracy", "准确"), ("coverage", "覆盖"),
@@ -43,7 +44,7 @@ def _metrics(topic):
 def _fields(topic):
     times, prefix = _metrics(topic)
     return ["quality", *(k for k, _ in DIMENSIONS), *(k for k, *_ in times),
-            prefix + "input_tokens", prefix + "output_tokens", prefix + "estimated_api_usd"]
+            prefix + "input_tokens", prefix + "output_tokens", prefix + "estimated_api_usd", "estimated_subscription_credits", "estimated_subscription_usd"]
 
 
 def _ordered(conditions):
@@ -59,7 +60,7 @@ def compact_data(data, source_sha256, cli_versions=None):
     require(len(sources) == len(data["source_batches"]), "Duplicate compact source identity")
     result = {"schema_version": 1, "generated_at": data.get("generated_at"),
               "source": "comparison-data.json", "source_sha256": source_sha256,
-              "topics": [], "rows": []}
+              "topics": [], "rows": [], "billing_context": data.get("billing_context")}
     seen = set()
     for topic in display_topics(data["cases"]):
         result["topics"].append({k: v for k, v in topic.items() if k != "conditions"})
@@ -75,6 +76,8 @@ def compact_data(data, source_sha256, cli_versions=None):
                    "execution_profile_id": c["execution_profile_id"], "source_id": src["id"],
                    "source_batch": src["batch"], "origin_batch_id": c["origin_batch_id"],
                    "price_as_of": src.get("price_as_of"), "cli_version": cli_versions.get(src["id"]),
+                    "billing_basis": "included_subscription_estimate", "billing_unit": "USD",
+                    "billing_rules_as_of": data.get("billing_context", {}).get("as_of"),
                    "model": c["model"], "effort": c["effort"],
                    "service_tier": c.get("service_tier", "default"),
                    "speed": c.get("speed_mode") or ("Fast" if c.get("service_tier") == "priority" else "Standard"),
@@ -116,7 +119,7 @@ def compact_cells(row, topic):
             " / ".join(_number(row.get(k), 0) for k in ("critical_errors", "error_answers")),
             *(metric(k, center, places) for k, _, center, places in times),
             " / ".join(metric(prefix + k, places=0, comma=True) for k in ("input_tokens", "output_tokens")),
-            metric(prefix + "estimated_api_usd", places=4)]
+            format_usd(row.get("estimated_subscription_usd_mean")) + _coverage(row, "estimated_subscription_usd")]
 
 
 def render_compact(compact, data):
@@ -127,14 +130,16 @@ def render_compact(compact, data):
 <p class="links"><a href="report.html">完整综合报告</a><a href="compact.csv">下载本表 CSV</a><a href="compact-data.json">下载本表 JSON</a><a href="comparison.zip">完整结果包</a></p>''']
     limits = list(dict.fromkeys([*(data.get("limitations") or []), *(data.get("assessment", {}).get("limitations") or [])]))
     parts.append('<div class="note">' + ''.join(f'<p>{esc(x)}</p>' for x in limits) + '</div>')
-    parts.append('<p><small>n 为有效／计划样本。指标覆盖完整时只显示一次 n；覆盖不足时在该值后标注 [已知数/有效数]，缺失显示“—”。质量为均值和范围；四维括号内为各项满分，旧评分缺少的维度保持未知。两种工程耗时都从请求发出计时，展示中位数：答案交付是最终正文完整返回，全部任务结束是所有已启动工作达到终态；固定材料仅展示完成耗时。用量为均值，工程模式使用全树计数；费用为采样时官方价估算的每份均值，不等于实扣。</small></p>')
+    billing = data.get("billing_context") or {}
+    parts.append('<p class="note">' + SUBSCRIPTION_LABEL + '展示均值；Standard 1×，Fast 2.5×。规则核对日期 ' + esc(billing.get("as_of") or "未知") + '。' + esc(billing.get("note") or "美元等值估算未知；不回退 API 美元。") + '</p>')
+    parts.append('<p><small>n 为有效／计划样本。指标覆盖完整时只显示一次 n；覆盖不足时在该值后标注 [已知数/有效数]，缺失显示“—”。质量为均值和范围；四维括号内为各项满分，旧评分缺少的维度保持未知。两种工程耗时都从请求发出计时，展示中位数：答案交付是最终正文完整返回，全部任务结束是所有已启动工作达到终态；固定材料仅展示完成耗时。用量为均值，工程模式使用全树计数。API 历史费用仅保留在下载数据中。</small></p>')
     for topic in compact["topics"]:
         times, prefix = _metrics(topic)
         rows = [r for r in compact["rows"] if r["topic_id"] == topic["id"]]
         dimensions = " / ".join(f"{label}（{_number(topic['dimension_maxima'].get(k), 0)}）" for k, label in DIMENSIONS)
         headers = ["档位", "速度", "模型", "CLI", "n", "质量均值 [范围]", dimensions,
                    "关键错误 / 错误答案", *(label for _, label, *_ in times),
-                   ("全树输入 / 输出 token" if prefix else "输入 / 输出 token"), "API 美元均值"]
+                   ("全树输入 / 输出 token" if prefix else "输入 / 输出 token"), SUBSCRIPTION_LABEL]
         title = topic.get("title") or topic.get("label") or topic["case_id"]
         mode = "工程只读" if prefix else "固定材料"
         parts.append(f'<section><h2>{esc(title)}</h2><p><small>评分 V{esc(topic["scoring_version"])} · {esc(mode)} · rubric {esc(topic["rubric_sha256"][:12])} · {len(rows)} 个配置。环境差异见完整报告。</small></p><div class="scroll" tabindex="0" role="region" aria-label="{esc(title)}对照表"><table><thead><tr>')

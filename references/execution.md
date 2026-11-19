@@ -79,7 +79,7 @@ case/
 
 无可靠价格时不传 `--prices`，报告费用为未知。输出 token 含 reasoning，不重复计费。估算缓存费用要求输入、缓存读取、缓存写入及输出计数齐全；字段未上报不当作 0。无缓存对照只需输入和输出。Codex credits 单独按其官方口径估算，不加未经验证的缓存写入加价。
 
-速度对照的价格快照使用 `schema_version: 2`，保留顶层 `as_of / sources`，分别在 `service_tiers.default.models` 与 `service_tiers.priority.models` 下按精确 model ID 填写同样的 rate 字段。Fast 缺价不回退 Standard。新批次用 `estimated_api_usd` 表示对应档位估算，旧批次维持原字段与导出格式。API 价格与 Codex purchased credits 按各自官方费率记录，不把订阅额度消耗倍率当作现金费率。
+速度对照的价格快照使用 `schema_version: 2`，保留顶层 `as_of / sources`，分别在 `service_tiers.default.models` 与 `service_tiers.priority.models` 下按精确 model ID 填写同样的 rate 字段。Fast 缺价不回退 Standard。新批次用 `estimated_api_usd` 表示对应档位估算，旧批次维持原字段与导出格式。API 价格与 Codex purchased credits 按各自官方费率记录，不把订阅额度消耗倍率当作现金费率。报告默认的单列订阅估算另用 `assets/subscription-pricing.json`（Fast 2.5×），按[离线综合报告](comparison.md)记录规则日期与限制，不覆盖封存 API 数据。
 
 ## 准备、预检、采样
 

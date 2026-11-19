@@ -369,9 +369,10 @@ class BenchmarkTests(unittest.TestCase):
         data_start = original.index('<script id="data" type="application/json">') + len('<script id="data" type="application/json">')
         data_end = original.index("</script>", data_start)
         payload = json.loads(original[data_start:data_end])
+        subscription_total = read(self.root / "subscription-prices.json")["known_subscription_usd"]
         cases = {
             "table_metric": original.replace("<td>4.00</td>", "<td>999999.00</td>", 1),
-            "total_cost": original.replace("已知费用合计 $0.011280", "已知费用合计 $999999", 1),
+            "total_cost": original.replace(f"估算费用合计 ${subscription_total:,.4f}", "估算费用合计 $999999", 1),
             "answer_label": original.replace('<details><summary>'+payload["answers"][0]["label"], '<details><summary>wrong-model', 1),
         }
         for key in ["cells", "answers"]:
@@ -394,6 +395,8 @@ class BenchmarkTests(unittest.TestCase):
     def test_html_renderer_has_no_file_or_clock_dependency(self):
         self.complete()
         data, context = summarize(self.root), reporting.report_context(self.root)
+        from billing import _pricing
+        _pricing.cache_clear()
         with patch("pathlib.Path.open", side_effect=AssertionError("renderer opened a file")), patch("reporting.now", side_effect=AssertionError("renderer read clock")):
             actual = reporting.render_html(data, context)
             self.assertEqual(actual, reporting.render_html(data, context))

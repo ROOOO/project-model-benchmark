@@ -13,18 +13,19 @@ from core import (METRICS, check_inputs, check_sensitive, digest,
                   scoring_weights, sha, write)
 from final_tps import ESTIMATE_FIELDS, estimate_final_tps, load_proxy_estimator
 from compact import compact_artifacts
+from billing import SUBSCRIPTION_METRICS, billing_context, subscription_metrics
 from reporting import AGENTIC_FLAGS, AGENTIC_METRICS, check_artifact_sensitive, execution_identity, idle, native_evidence_files, runtime_fingerprint, summarize, validate_records
 
 
 DIMENSIONS = ("accuracy", "coverage", "readability", "insight")
 CANONICAL_METRICS = tuple(dict.fromkeys(
     "estimated_api_usd" if x == "estimated_standard_api_usd" else x for x in METRICS))
-STAT_FIELDS = tuple(dict.fromkeys(CANONICAL_METRICS + AGENTIC_METRICS)) + DIMENSIONS + ("quality",)
+STAT_FIELDS = tuple(dict.fromkeys(CANONICAL_METRICS + AGENTIC_METRICS + SUBSCRIPTION_METRICS)) + DIMENSIONS + ("quality",)
 IDENTITY_FIELDS = ("case", "batch", "origin_batch_id", "execution_mode", "execution_profile_id", "model", "effort", "service_tier", "speed_mode")
 PAIR_FIELDS = ("case", "model", "effort", "kind", "standard_condition", "fast_condition",
                "standard_batch", "fast_batch", "standard_valid", "fast_valid",
                "standard_elapsed_median_s", "fast_elapsed_median_s", "elapsed_reduction_pct",
-               "speedup", "ttft_reduction_pct", "decode_tps_gain_pct", "cost_ratio")
+               "speedup", "ttft_reduction_pct", "decode_tps_gain_pct", "cost_ratio", "subscription_cost_ratio")
 DEFAULT_LIMITATIONS = [
     "只比较已封存答案，不新增模型采样；单题及小样本差异不能直接推广到其他任务。",
     "质量按题目和评分细则分别展示，不合并不同题目或细则的分数；旧分值保留原尺度，缺失维度为未知。",
@@ -32,7 +33,7 @@ DEFAULT_LIMITATIONS = [
     "评分属于 AI 辅助评阅；事后重评与先前身份暴露等限制沿用各来源记录。",
     "耗时与首字等待、TPS 均为客户端观测，受排队、网络、思考、输出及缓冲影响。",
     "Fast 收益比较组中位数，不是逐次配对实验；跨批次仅为历史观察，环境与价格可能不同。",
-    "费用使用采样时封存的价格和已知用量估算，不是实际网关扣款；未知费用不视为零。",
+    "价格表默认显示订阅 Standard 1×、Fast 2.5× 的美元等值估算，用于比较，不代表实际现金扣费或套餐扣减。历史 API 美元保留在原始数据，未知费用不视为零。",
 ]
 
 
@@ -90,7 +91,8 @@ def _pair(case, standard, fast, kind):
             "speedup": _ratio(elapsed_a, elapsed_b),
             "ttft_reduction_pct": 100 * (1 - ttft_ratio) if ttft_ratio is not None else None,
             "decode_tps_gain_pct": 100 * (tps_ratio - 1) if tps_ratio is not None else None,
-            "cost_ratio": _ratio(_median(fast, "estimated_api_usd"), _median(standard, "estimated_api_usd"))}
+            "cost_ratio": _ratio(_median(fast, "estimated_api_usd"), _median(standard, "estimated_api_usd")),
+            "subscription_cost_ratio": _ratio(_median(fast, "estimated_subscription_credits"), _median(standard, "estimated_subscription_credits"))}
 
 
 def fast_observations(cases):
@@ -190,6 +192,9 @@ def build_data(run_dirs, models=None, assessment=None, *, final_tps=None):
                         remote_completion="unknown" if row["status"] != "completed" else "completed",
                         actual_gateway_charge=row.get("actual_gateway_charge"),
                         dimension_maxima=weights)
+            item.update(subscription_metrics(record))
+            item.update(billing_basis="included_subscription_estimate", billing_unit="USD",
+                        billing_rules_as_of=billing_context()["as_of"])
             if final_tps is not None:
                 answer = inside(root, row["answer_link"]).read_bytes().decode("utf-8-sig") if row.get("selected") and row.get("valid") and row.get("status") == "completed" else ""
                 item.update(estimate_final_tps(record, row, answer, final_tps[0]))
@@ -272,11 +277,15 @@ def build_data(run_dirs, models=None, assessment=None, *, final_tps=None):
               "cases": values, "source_batches": sources, "samples": rows, "failures": failures,
               "paired_speed_observations": pairs, "pairing_notes": pairing_notes,
               "assessment": assessment_value(assessment), "limitations": DEFAULT_LIMITATIONS,
+              "billing_context": billing_context(),
               "definitions": {"quality": "各题各评分细则独立展示，不汇总跨题质量或费用加权总分。",
                               "elapsed_s": "客户端完成耗时，单位秒；旧模式到根 turn 完成，工程代理模式到任务树终态；不同执行模式不合并。",
                               "ttft_visible_s": "首个非空可见 delta 的客户端等待时间，单位秒。",
                               "visible_decode_tps": "可见输出 token / 首末非空可见 delta 间隔；受客户端缓冲影响。",
                               "estimated_api_usd": "已封存价格快照估算；兼容旧 estimated_standard_api_usd，未知不计为零。",
+                              "estimated_subscription_credits": "按规则核对日期的公开 token credits 权重与订阅速度倍率逐实际响应重估；主/子模型和速度各自计量，完整值不含未知响应。不是套餐实际扣减或现金价格。",
+                              "estimated_subscription_usd": "订阅 credits 估算除以 billing_context.usd_equivalent.credits_per_usd，按已核验 Standard token 价格权重换算美元等值；不是实际现金扣费或历史 API 估算。",
+                              "subscription_cost_ratio": "Fast / Standard 组中位订阅消耗估算比，包含实际用量差异；不是固定计费倍率。",
                               "output_tokens": "包含推理 token 的用量输出计数；表中均值与图中统计口径分别标注。",
                               "omission_answers": "原评分记录中的遗漏标记；不等于正式覆盖度扣分答案数。",
                               "fast_observations": "同批优先；跨批仅在一对候选唯一时显示历史观察；不逐次配对。"},
@@ -326,7 +335,8 @@ def export_tables(data):
     condition_fields = list(dict.fromkeys(k for row in conditions for k in row))
     sample_fields = [*IDENTITY_FIELDS, "source_id", "slot_id", "attempt", "repetition", "status", "valid", "selected",
                      "anonymous_id", "attempt_identity", *DIMENSIONS, "quality", *CANONICAL_METRICS,
-                     *AGENTIC_METRICS, *AGENTIC_FLAGS,
+                      *AGENTIC_METRICS, *AGENTIC_FLAGS, *SUBSCRIPTION_METRICS,
+                      "billing_basis", "billing_unit", "billing_rules_as_of",
                      "critical_errors", "errors", "omissions", "actual_gateway_charge", "remote_completion",
                      "answer_sha256", "result_sha256", "answer_link", "source_answer_url"]
     if data.get("final_tps_estimation"):
