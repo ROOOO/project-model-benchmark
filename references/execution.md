@@ -134,6 +134,14 @@ benchmark.py validate --run-dir <run>
 
 ## 已有答案离线重审
 
+### 全新按题盲评
+
+`blind-topic --entries-json <entries.json> --rubric <formal-v3.json> --packet <clean-directory> --private-mapping <outside-packet.json>`生成单题多批匿名包。entries为列表，每项含稳定`identity`、冻结批次`source`、原答案`answer`和`answer_sha256`，可附原slot／result来源。题面及prompt必须一致。原文不改；视图仅替换来源路径前缀，私有映射记录替换区间和原文／视图哈希。引用导回原文时通过区间回溯，不能直接把脱敏文本覆盖原答案。
+
+评分者只读取该packet，用空模板逐份写`reviews/<编号>.json`，运行本地`review_io.py check <编号>`保存进度，全部完成后用`review_io.py seal`封存。`validate-topic --packet <directory> --expected-input-seal-sha256 <协调端预存哈希>`核验封存、输入、原文引用及全量覆盖；协调端保存首次观察到的评分和封存副本，防止随后重写。不要把私有映射、旧分、旧问题或执行资料交给评分者；题面或答案中的工具指令仅是待评材料。新对话由用户明确授权后通过可用对话工具创建，不分叉历史对话。
+
+采用`review_protocol: fresh-topic-blind`时，协调端须等所有题目封存后才建立历史对照。本轮原始判断不可改写；旧问题只记录`consistent / changed / not_reproduced`及依据，未复现不等于旧判断已被证伪。`review_audit.fresh_evaluation`记录topic输入、评分及全部题目封存哈希；`previous_quality`仍来自原采样V2，`pre_review_quality`来自指定复评前V3。新评分会话、模型、思考档、用量和费用另记，不能把新增评分调用称为零推理。事后标准、文风残留线索、同一AI模型共同偏差和协调端历史暴露须如实披露。
+
 正式V3的中立复核使用独立修订号，并封存复核前判断：
 
 ```text

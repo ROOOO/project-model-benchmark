@@ -132,7 +132,8 @@ def _review_previous(row):
     if not row.get("review_revision"):
         return ""
     delta = row.get("review_quality_delta_mean")
-    change = f' · Δ{Decimal(str(delta)):+.2f}' if delta is not None else ""
+    rounded = Decimal(str(delta)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) if delta is not None else None
+    change = f' · Δ{rounded:+.2f}' if rounded is not None else ""
     return '<br><small class="review-previous">复核前 V3 ' + _number(row.get("pre_review_quality_mean"), 2) + change + '</small>'
 
 

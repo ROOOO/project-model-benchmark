@@ -282,6 +282,10 @@ def regrade(source, rubric_path, output, *, repair_final_answers=False, conditio
         manifest.update(review_revision=review_revision,
             review_source={"source_root":str(neutral_review),"source_files_sha256":neutral_before},
             note="正式V3中立复核：权重、核验点和原则处罚不变；全篇复核后逐项对照旧判断。评分者已见过历史身份，非独立盲评；零新增采样，主对照仍为原V2。")
+        if gold.get('review_protocol') == 'fresh-topic-blind':
+            manifest.update(review_protocol='fresh-topic-blind', evaluator_previously_saw_model_identity=False,
+                coordinator_previously_saw_model_identity=True,
+                note='正式V3全新按题评分上下文：先封存所有匿名评分，协调端再关联历史；标准属于事后制定，同一AI评分模型仍可能有共同偏差。不新增答题采样，有新增评分调用；主对照仍为原V2。')
     write(output / "evaluation/manifest.json", manifest)
     protocol = protocol | {"offline_regrade": True, "evaluation_manifest_sha256": digest(manifest)}
     write(output / "protocol.json", protocol)

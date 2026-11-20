@@ -396,6 +396,8 @@ def seal(root, scores_path):
         value.update(scoring_version=gold["scoring_version"], scoring_weights=scoring_weights(gold))
         if check_inputs(root).get("offline_regrade"):
             value["evaluator"] = read(root / "evaluation/manifest.json")["note"] + " AI-assisted, no new inference."
+            if read(root / 'evaluation/manifest.json').get('review_protocol') == 'fresh-topic-blind':
+                value['evaluator'] = read(root / 'evaluation/manifest.json')['note'] + ' Fresh-context AI grading, no new answer sampling.'
     write(grading / "seal.json", value)
     return {"sealed_answers": len(scores)}
 
@@ -1003,6 +1005,9 @@ def validate(root, partial=False, *, write_receipt=False):
         if write_receipt:
             write(root / "ui-check.json", ui_check)
     value = {"at": now(), "passed": True, "attempts_checked": len(attempts), "planned_slots": len(evaluation_schedule(root, p)), "scores_sealed": (root / "grading/seal.json").exists(), "partial_report": partial, "no_new_inference": True}
+    if (root / 'evaluation/manifest.json').is_file() and read(root / 'evaluation/manifest.json').get('review_protocol') == 'fresh-topic-blind':
+        value.pop('no_new_inference')
+        value.update(validation_started_inference=False, new_answer_sampling=0, external_scoring_inference=True)
     if write_receipt:
         write(root / "validation.json", value)
     return value

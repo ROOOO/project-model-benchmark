@@ -22,6 +22,37 @@ class NeutralReviewTests(unittest.TestCase):
     grade=fixtures.ComparisonTests.grade
     run_fixture=fixtures.ComparisonTests.run_fixture
 
+    def test_independent_protocol_preserves_v2_and_reports_new_scoring_inference(self):
+        source=self.run_fixture('original',tiers=['default'],efforts=['max'],version=2)
+        trial=v3_gold(core.read(source/'input/gold.json'))
+        gold4=v4_gold_from_v3(trial);gold=formal_v3_gold(gold4)
+        path=self.base/'gold.json';core.write(path,gold)
+        old=self.base/'old';regrade(source,path,old);blind(old)
+        prior=formal_v3_score(v4_score_from_v3(add_issue(sample_score(),'error','key'),trial),gold4)
+        scores_path=self.base/'old-scores.json';core.write(scores_path,{a:copy.deepcopy(prior) for a in core.read(old/'grading/private-mapping.json')})
+        seal(old,scores_path);build_report(old)
+        gold.update(review_revision='fresh-r1',review_protocol='fresh-topic-blind');core.write(path,gold)
+        target=self.base/'fresh';regrade(source,path,target,review_from=old,review_revision='fresh-r1');blind(target)
+        manifest=core.read(target/'evaluation/manifest.json')
+        self.assertFalse(manifest['evaluator_previously_saw_model_identity'])
+        self.assertTrue(manifest['coordinator_previously_saw_model_identity'])
+        score=copy.deepcopy(prior);score['issues']=[]
+        for c in score['checks'].values():c['status']='correct'
+        score['points']['A']=70
+        original_digest=core.digest(score)
+        score.update(review_revision='fresh-r1',review_audit={'revision':'fresh-r1','old_judgment':prior,
+            'pre_review_quality':core.principle_score(prior,gold)['quality'],'whole_answer_reviewed':True,
+            'first_pass_seal_sha256':'seal','old_issue_dispositions':[{'old_index':0,'action':'not_reproduced','reason':'Independent checkpoint judgment differs; not a finding that the old judgment was false.'}],
+            'criterion_changes':{cid:{'before':prior['points'][cid],'after':v,'delta':float(Decimal(str(v))-Decimal(str(prior['points'][cid]))),'reason':'Independent review.'} for cid,v in score['points'].items()},
+            'fresh_evaluation':{'review_protocol':'fresh-topic-blind','history_revealed_after_all_topic_seals':True,
+                'original_judgment_sha256':original_digest,**{k:'sealed' for k in ('topic_seal_sha256','input_seal_sha256','view_score_sha256','all_topics_seal_sha256')}}})
+        core.write(scores_path,{a:copy.deepcopy(score) for a in core.read(target/'grading/private-mapping.json')})
+        seal(target,scores_path);summary=build_report(target);receipt=validate(target)
+        self.assertEqual(summary['previous_evaluation']['scoring_version'],2)
+        self.assertEqual(receipt['new_answer_sampling'],0);self.assertTrue(receipt['external_scoring_inference'])
+        self.assertNotIn('no_new_inference',receipt)
+        self.assertNotIn('no new inference',core.read(target/'grading/seal.json')['evaluator'].lower())
+
     def test_fresh_judgment_audit_and_both_comparison_baselines_survive_exports(self):
         source=self.run_fixture('original',tiers=['default'],efforts=['max'],version=2)
         trial=v3_gold(core.read(source/'input/gold.json'))

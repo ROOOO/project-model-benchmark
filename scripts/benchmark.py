@@ -55,6 +55,14 @@ def parser():
     revision.add_argument("--review-from", help="Archive the pre-review formal V3 judgments for a fresh review of the same answers")
     revision.add_argument("--review-revision", help="Frozen review revision ID; requires --review-from")
     revision.add_argument("--repair-final-answers", action="store_true", help="Re-extract canonical completed finals from archived native events; no model calls")
+    topic = sub.add_parser("blind-topic", help="Prepare a clean anonymous topic packet from existing answers; no inference")
+    topic.add_argument("--entries-json", required=True)
+    topic.add_argument("--rubric", required=True)
+    topic.add_argument("--packet", required=True)
+    topic.add_argument("--private-mapping", required=True)
+    topic_check = sub.add_parser("validate-topic", help="Validate a sealed independent anonymous topic review")
+    topic_check.add_argument("--packet", required=True)
+    topic_check.add_argument("--expected-input-seal-sha256")
     comparison = sub.add_parser("compare", help="Create a separate offline comparison from sealed runs; never starts inference")
     comparison.add_argument("--run-dirs", nargs="+", required=True)
     comparison.add_argument("--output", required=True)
@@ -150,6 +158,12 @@ def main(argv=None):
         if args.review_from or args.review_revision:
             options.update(review_from=args.review_from, review_revision=args.review_revision)
         value = regrade(args.run_dir, args.rubric, args.output, repair_final_answers=args.repair_final_answers, **options)
+    elif args.command == "blind-topic":
+        from fresh_blind import prepare_topic
+        value = prepare_topic(read(args.entries_json), args.rubric, args.packet, args.private_mapping)
+    elif args.command == "validate-topic":
+        from fresh_blind import check_topic_seal
+        value = check_topic_seal(args.packet, args.expected_input_seal_sha256)
     elif args.command == "compare":
         options = {}
         if args.estimate_answer_tps:

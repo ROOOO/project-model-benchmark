@@ -1,7 +1,7 @@
 """Provenance and consistency checks for a fresh offline review of sealed answers."""
 from pathlib import Path
 
-from core import check_inputs, inside, principle_score, read, require, scoring_gold, sha, three_dimension_scoring
+from core import check_inputs, digest, inside, principle_score, read, require, scoring_gold, sha, three_dimension_scoring
 
 
 def prepare_review_source(source, review, gold, selected_slots):
@@ -45,7 +45,9 @@ def validate_review_scores(root, mapping, scores, gold):
     old_scores, old_mapping = read(base/'grading/scores.json'), read(base/'grading/private-mapping.json')
     old_gold = read(base/'rubric.json')
     by_result = {relative:old_scores[anon] for anon,relative in old_mapping.items()}
-    revision = read(Path(root)/'evaluation/manifest.json')['review_revision']
+    manifest = read(Path(root)/'evaluation/manifest.json')
+    revision = manifest['review_revision']
+    fresh = manifest.get('review_protocol') == 'fresh-topic-blind'
     for anon, relative in mapping.items():
         score, old = scores[anon], by_result[relative]
         audit = score.get('review_audit', {})
@@ -54,7 +56,8 @@ def validate_review_scores(root, mapping, scores, gold):
         require(audit.get('old_judgment') == old, 'Review did not preserve the sealed old judgment')
         dispositions = audit.get('old_issue_dispositions', [])
         require(sorted(d.get('old_index') for d in dispositions) == list(range(len(old['issues']))), 'Every old issue needs exactly one disposition')
-        require(all(d.get('action') in ('retained','revised','withdrawn') and d.get('reason') for d in dispositions), 'Review disposition needs action and reason')
+        allowed = ('consistent','changed','not_reproduced') if fresh else ('retained','revised','withdrawn')
+        require(all(d.get('action') in allowed and d.get('reason') for d in dispositions), 'Review disposition needs action and reason')
         changes = audit.get('criterion_changes', {})
         require(set(changes) == set(score['points']), 'Review must account for every scoring item')
         for cid, value in changes.items():
@@ -62,6 +65,15 @@ def validate_review_scores(root, mapping, scores, gold):
                     and value.get('reason'), 'Incorrect base-score change audit')
             require(Decimal(str(value['delta'])) == Decimal(str(value['after']))-Decimal(str(value['before'])), 'Incorrect base-score delta')
         require(audit.get('first_pass_seal_sha256') and audit.get('whole_answer_reviewed') is True, 'Missing first-pass review provenance')
+        if fresh:
+            provenance = audit.get('fresh_evaluation', {})
+            require(provenance.get('review_protocol') == 'fresh-topic-blind'
+                    and all(provenance.get(k) for k in ('topic_seal_sha256','input_seal_sha256','view_score_sha256','all_topics_seal_sha256'))
+                    and provenance.get('history_revealed_after_all_topic_seals') is True,
+                    'Missing independent topic-seal provenance')
+            independent = {k:v for k,v in score.items() if k not in ('review_revision','review_audit')}
+            require(provenance.get('original_judgment_sha256') == digest(independent),
+                    'Independent judgment changed while attaching history')
 
 
 def review_quality_by_answer(root):
