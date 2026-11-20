@@ -395,7 +395,7 @@ def compare(run_dirs, output, models=None, assessment=None, *, estimate_answer_t
         require(sha(record_destination) == row["result_sha256"], "Copied attempt record differs from source")
         for name in ("events.jsonl", "task-tree.json"):
             companion = record_source.with_name(name)
-            if companion.is_file() and row["execution_mode"] == "project-readonly":
+            if companion.is_file() and row["execution_mode"] in ("project-readonly", "project-readonly-cli", "project-full-access-cli"):
                 check_artifact_sensitive(companion)
                 target = record_destination.with_name(name)
                 shutil.copyfile(companion, target)

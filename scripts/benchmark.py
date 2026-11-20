@@ -63,6 +63,26 @@ def parser():
     recovery = sub.add_parser("recover-smoke", help="Replay an archived capability check into a fresh revision; no inference")
     recovery.add_argument("--run-dir", required=True)
     recovery.add_argument("--source", required=True)
+    study_prepare = sub.add_parser("study-prepare", help="Prepare an Antigravity multi-topic cycle study; no inference")
+    study_prepare.add_argument("--source-runs", nargs="+", required=True, help="Sealed historical batches, in topic order")
+    study_prepare.add_argument("--study-dir", required=True)
+    study_prepare.add_argument("--model", required=True)
+    study_prepare.add_argument("--effort", required=True)
+    study_prepare.add_argument("--cycles", type=int, default=5)
+    study_prepare.add_argument("--agy")
+    study_prepare.add_argument("--runtime-read-roots", nargs="+")
+    study_prepare.add_argument("--access-mode", choices=["restricted", "full-access"], default="restricted")
+    for command in ("study-preflight", "study-smoke", "study-run", "study-resume", "study-status", "study-recover-smoke"):
+        q = sub.add_parser(command)
+        q.add_argument("--study-dir", required=True)
+        if command != "study-status":
+            q.add_argument("--agy")
+        if command == "study-resume":
+            q.add_argument("--retry-failed", action="store_true")
+        if command == "study-smoke":
+            q.add_argument("--retry-failed", action="store_true")
+        if command == "study-recover-smoke":
+            q.add_argument("--source", required=True)
     for command in ["prepare", "retest"]:
         q = sub.add_parser(command, help="Prepare a new batch; never starts inference")
         q.add_argument("--case-dir" if command == "prepare" else "--parent", required=True)
@@ -95,7 +115,22 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
-    if args.command == "discover":
+    if args.command.startswith("study-"):
+        import study
+        if args.command == "study-prepare":
+            value = study.prepare(args.source_runs, args.study_dir, args.model, args.effort, args.cycles,
+                                  args.agy, args.runtime_read_roots, access_mode=args.access_mode)
+        elif args.command == "study-preflight":
+            value = study.preflight(args.study_dir, args.agy)
+        elif args.command == "study-smoke":
+            value = study.smoke(args.study_dir, args.agy, retry_failed=args.retry_failed)
+        elif args.command == "study-status":
+            value = study.status(args.study_dir)
+        elif args.command == "study-recover-smoke":
+            value = study.recover_smoke(args.study_dir, args.source, args.agy)
+        else:
+            value = study.execute(args.study_dir, args.agy, args.command == "study-resume", getattr(args, "retry_failed", False))
+    elif args.command == "discover":
         value = select_project(args.project, None if args.no_current else args.current, read(args.projects_json) if args.projects_json else None, read(args.threads_json) if args.threads_json else None)
         if args.output:
             write(args.output, value)
@@ -129,6 +164,9 @@ def main(argv=None):
         value = {"run_dir": str(root), "title": p["title"], "planned_calls": len(p["schedule"]), "inference_started": False}
     else:
         root = Path(args.run_dir).resolve()
+        if args.command in ("preflight", "smoke", "run", "resume"):
+            require(check_inputs(root).get("runtime_backend") != "antigravity",
+                    "Antigravity batches use study-preflight/study-smoke/study-run/study-resume with --study-dir")
         if args.command == "preflight":
             p = check_inputs(root)
             server = Server(root, args.codex)

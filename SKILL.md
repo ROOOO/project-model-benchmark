@@ -15,6 +15,8 @@ description: 从工程常见问题制作固定证据实验，对比 Codex 模型
 
 脚本入口为本 skill 的 `scripts/benchmark.py`，Python 3.11+；默认仅使用标准库。显式启用正文 TPS 代理估算时，额外使用独立安装的 `tiktoken`，详见 [离线综合报告](references/comparison.md)。日常工程选型默认使用 `project-readonly`，准备源码快照和原生工具权限时读 [工程代理执行](references/agentic.md)；其他接口读 [执行接口](references/execution.md)；选题与评分读 [实验方法](references/methodology.md)；已有结果的增强视图读 [离线综合报告](references/comparison.md)。不要重写一套临时 runner。
 
+用户指定 Antigravity CLI 复测已有题目时，使用现有入口的 `study-*` 命令，按[Antigravity 循环测试](references/antigravity.md)准备与执行。默认后端标为 `project-readonly-cli`；用户明确要求 Full Access 时使用 `--access-mode full-access`，新批次标为 `project-full-access-cli`，以会话参数取消权限限制，源码与评分资料的读取边界改为任务指令并审计实际工具访问。不套用 Codex MXC、Ultra 验收或计费权重。多题轮流采样按封存的循环顺序执行，不先耗尽单题次数。
+
 ## 新建测试
 
 1. **确定工程。** 用户指定路径优先，其次当前工程。读取适用的 `AGENTS.md`；多仓工程先解析 workspace/registry，再依据业务路由选择实际源码仓，不把入口仓误当业务实现。只读代码、日志和 SCM 历史，不修改业务仓。

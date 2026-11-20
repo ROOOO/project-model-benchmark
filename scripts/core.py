@@ -408,6 +408,9 @@ def metrics(usage, elapsed, first=None, last=None, answer="", rates=None):
 
 
 def metrics_for_protocol(protocol, usage, elapsed, first=None, last=None, answer="", rates=None):
+    if protocol.get("runtime_backend") == "antigravity":
+        from antigravity import cli_metrics
+        return cli_metrics(protocol, usage, elapsed, first, last, answer, rates)
     result = metrics(usage, elapsed, first, last, answer, rates)
     if "service_tiers" in protocol:
         result["estimated_api_usd"] = result.pop("estimated_standard_api_usd")

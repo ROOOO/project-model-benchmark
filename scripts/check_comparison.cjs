@@ -56,6 +56,11 @@ const document = {
 };
 const ctx = vm.createContext({ document });
 vm.runInContext(executable[0][2], ctx, { timeout: 10000 });
+for (const [mode, label] of Object.entries({'project-readonly':'工程只读 · 原生代理',
+  'project-full-access-cli':'工程 CLI · Full Access', 'project-readonly-cli':'工程 CLI · 受限',
+  'fixed-evidence':'固定材料 · 禁工具'})) {
+  eq(vm.runInContext(`executionLabel({execution_mode:${JSON.stringify(mode)}})`, ctx), label, 'execution condition label');
+}
 for (const unsafe of ['javascript:alert(1)', '  javascript:alert(1)', 'java\nscript:alert(1)', 'data:text/html,hello']) {
   eq(vm.runInContext('safeURL(' + JSON.stringify(unsafe) + ')', ctx), '#', 'unsafe link scheme');
 }

@@ -227,6 +227,9 @@ def check_profile(profile, runtime=True, runroot=None):
     Offline exports can pass their new runroot without needing the original
     temporary work directory by setting runtime=False. Sampling uses the default.
     """
+    if isinstance(profile, dict) and profile.get("policy", {}).get("backend") == "antigravity-native":
+        from antigravity import check_profile as check_cli_profile
+        return check_cli_profile(profile, runtime, runroot)
     require(isinstance(profile, dict) and profile.get("schema_version") == PROFILE_VERSION and profile.get("mode") == "project-readonly", "Unsupported execution profile")
     require(profile.get("policy") == POLICY, "Execution policy changed or unsupported")
     require(profile.get("profile_sha256") == _profile_hash(profile), "Frozen execution profile changed")

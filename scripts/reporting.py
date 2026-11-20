@@ -40,7 +40,7 @@ def execution_identity(protocol, fingerprint=None):
     mode = profile.get("mode", "fixed-evidence")
     if mode == "fixed-evidence":
         return mode, digest({"mode": mode})
-    require(mode == "project-readonly", "Unknown execution mode")
+    require(mode in ("project-readonly", "project-readonly-cli", "project-full-access-cli"), "Unknown execution mode")
     identity = profile.get("comparison_fingerprint")
     require(isinstance(identity, str) and bool(re.fullmatch(r"[0-9a-f]{64}", identity)),
             "Project-readonly profile needs a frozen comparison fingerprint")
@@ -80,7 +80,17 @@ def check_artifact_sensitive(path, binary_source=False):
 def native_evidence_files(root):
     """Allowlist native capability receipts and archived scratch; never follow links."""
     root = Path(root)
-    if execution_identity(read(root / "protocol.json"))[0] != "project-readonly":
+    protocol = read(root / "protocol.json")
+    if protocol.get("runtime_backend") == "antigravity":
+        candidates = [root / "cli-capability.json"] if (root / "cli-capability.json").is_file() else []
+        candidates.extend((root / "capability").glob("runs/*/attempt-*/*"))
+        candidates.extend((root / "runs").glob("*/attempt-*/session-settings.json"))
+        allowed = {"answer.txt", "result.json", "events.jsonl", "session-settings.json", "cli-capability.json"}
+        for path in candidates:
+            require(not path.is_symlink() and not (getattr(path.lstat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT),
+                    "CLI evidence must not be linked")
+        return sorted(path for path in candidates if path.is_file() and path.name in allowed)
+    if execution_identity(protocol)[0] != "project-readonly":
         return []
 
     def no_links(path):
@@ -466,6 +476,12 @@ def summarize(root, partial=False):
                       accounting_complete_attempts=sum(r.get("accounting_complete") is True for r in rows),
                       known_observed_cost_usd=sum(r["tree_observed_api_usd"] for r in rows if r.get("tree_observed_api_usd") is not None),
                       observed_cost_coverage_attempts=sum(r.get("tree_observed_api_usd") is not None for r in rows))
+    if p.get("runtime_backend") == "antigravity":
+        result.update(execution_mode=p["execution_profile"]["mode"], runtime_backend="antigravity",
+                      contaminated_answers=sum(r.get("contaminated") is True for r in attempts),
+                      cli_tool_access=[{"slot_id": r["slot_id"], "attempt": r["attempt"],
+                                       "contaminated": r.get("contaminated"), "access": r.get("tool_access")} for r in attempts],
+                      execution_profile_id=execution_identity(p, runtime_fingerprint(root))[1])
     if tiered:
         result.update(schema_version=2, service_tiers=protocol_tiers(p), tier_comparisons=tier_comparisons(cells, weights))
     if version == 2:
@@ -717,6 +733,11 @@ def render_html(data, context):
         limits[1:4] = ["在冻结工程源码及相同可用工具下进行只读分析，保留原生委派策略；不评价业务代码修改。",
                        "答案就绪与全任务结束分别计时；正文首字与首次进度分别报告。根输出 TPS 仅在用量可归属时提供，不能把全树输出除以根答案时长。",
                        "全树用量按唯一响应去重；未收齐响应或未知价格保留未知，已观测消耗单列。"]
+    elif p.get("runtime_backend") == "antigravity":
+        limits[1:5] = ["官方 Antigravity CLI 工程分析；冻结题面与源码相同，原生指令、工具、权限和历史 Codex 不同。",
+                       "本次权限模式：" + p["execution_profile"]["mode"] + "；Full Access 依赖任务指令约束，评分资料未被系统隔离。",
+                       "CLI 完成耗时从进程启动到退出，包含启动、网络、工具、思考和输出；与历史 Codex 的请求至终态计时口径不同。",
+                       "CLI 原生累计用量保留；最终正文 TPS、完整子代理用量及全树终态未核验，费用未知。"]
     limit_html = "".join("<li>"+html.escape(str(x))+"</li>" for x in limits)
     raw = "".join('<details><summary>'+html.escape(a["label"])+'</summary><a href="'+quote(a["link"], safe="/")+'">原始答案</a><article>'+markdown(a["text"])+'</article></details>' for a in data["answers"])
     page = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>工程模型 Benchmark</title><style>
@@ -731,6 +752,14 @@ def render_html(data, context):
     values = {"TITLE": html.escape(data["title"]), "BATCH": html.escape(data["batch"]), "PROJECT": html.escape(data["project"].get("name", data["project"]["root"])), "VALID": str(data["valid_completed"]), "PLANNED": str(data["planned"]), "ATTEMPTS": str(data["attempt_count"]), "STATUS": ("全量成功" if data["scores_sealed"] else "采样完成，评分未封存") if data["all_planned_successful"] else "有失败或缺口", "CONCLUSION": html.escape(assessment["conclusion"]), "EVIDENCE": evidence, "TABLE": condition_table(data["conditions"]), "TIME": fmt(data["observed_total_elapsed_s"]), "COST": format_usd(data["known_subscription_usd"]), "COVERAGE": str(data["subscription_usd_coverage_attempts"]), "PRICE_DATE": html.escape(data["billing_context"]["as_of"]), "PARENT": comparison, "DETAIL": "".join(detail), "PROMPT": markdown(context["prompt"]), "GOLD": html.escape(json.dumps(context["gold"], ensure_ascii=False, indent=2)), "HASHES": html.escape(json.dumps(p["input_hashes"], indent=2)), "RAW": raw, "LIMITS": limit_html, "PRICES": html.escape(json.dumps(prices, ensure_ascii=False, indent=2)), "DATA": payload}
     intro, old_evaluation, audit = evaluation_html(data, context)
     values["TABLE"] = intro + values["TABLE"] + audit + agentic_html(data)
+    if p.get("runtime_backend") == "antigravity":
+        rows = "".join("<tr><td>" + html.escape(str(row["slot_id"]) + "/" + str(row["attempt"])) + "</td><td>" +
+                       html.escape(", ".join((row.get("access") or {}).get("tools", []))) + "</td><td>" +
+                       ("评分资料访问已标记，排除干净统计" if row.get("contaminated") else "未在可见工具中检出") + "</td></tr>"
+                       for row in data.get("cli_tool_access", []))
+        values["TABLE"] += '<section><h2>CLI 权限与工具访问</h2><p>' + html.escape(p["execution_profile"]["mode"]) + \
+                           '</p><table><tr><th>样本／尝试</th><th>实际工具</th><th>评分资料访问</th></tr>' + rows + \
+                           '</table><p class="note">仅覆盖 CLI 暴露的工具参数；不证明未暴露的子代理访问。完整证据保存在原始事件中。</p></section>'
     values["PARENT"] += old_evaluation
     if "service_tiers" in p:
         values["TABLE"] += tier_comparison_html(data)
@@ -797,7 +826,10 @@ def validate_records(root):
         if r.get("thread_id"):
             require(r["thread_id"] not in tids, "Thread reused between attempts")
             tids.add(r["thread_id"])
-        if agentic_mode:
+        if p.get("runtime_backend") == "antigravity":
+            from antigravity import validate_record
+            recalculated = validate_record(root, p, r, directory, answer)
+        elif agentic_mode:
             from agentic import TreeLedger
             snapshot = r.get("agentic")
             if snapshot is None:

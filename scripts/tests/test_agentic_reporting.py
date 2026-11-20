@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core
 from agentic import TreeLedger
 from comparison import compare
+from compact import compact_artifacts
 from reporting import agentic_html, archive, capability_summary, check_artifact_sensitive, execution_identity, native_evidence_files, summarize, validate_records
 from test_agentic import usage
 from test_benchmark import fixture, RATES, write_attempt
@@ -135,6 +136,47 @@ class AgenticReportingTests(unittest.TestCase):
         data = core.read(output / "comparison-data.json")
         self.assertEqual(len(data["cases"]), 1)
         self.assertEqual(data["paired_speed_observations"][0]["kind"], "historical-observation")
+
+    def test_cli_overview_keeps_modes_metrics_and_unknown_cost_separate(self):
+        readonly = self.make_run("readonly")
+        cli_fixture = self.make_run("cli-fixture", agentic=False)
+        output = self.base / "comparison"
+        compare([readonly, cli_fixture], output)
+        data = core.read(output / "comparison-data.json")
+        cli_case = next(c for c in data["cases"] if c["execution_mode"] == "fixed-evidence")
+        cli_case["execution_mode"] = "project-full-access-cli"
+        for condition in cli_case["conditions"]:
+            condition.update(execution_mode="project-full-access-cli", model="gemini-4-neon-xhigh", effort="xhigh")
+            for key in ("estimated_subscription_usd", "estimated_subscription_credits", "estimated_api_usd"):
+                condition["statistics"][key] = core.distribution([])
+        artifacts = compact_artifacts(data, "sealed-source-hash")
+        compact = json.loads(artifacts["compact-data.json"])
+        overview = json.loads(artifacts["question-overview.json"])
+        self.assertEqual(compact["topic_count"], 2)
+        self.assertEqual(len(overview["topics"]), 1)
+        self.assertFalse(overview["statistics_merged"])
+        self.assertEqual(overview["additional_model_calls"], 0)
+        rows = {r["execution_mode"]: r for r in overview["rows"]}
+        cli = rows["project-full-access-cli"]
+        native = rows["project-readonly"]
+        self.assertEqual(cli["delivery_metric"], "elapsed_s")
+        self.assertEqual(cli["delivery_s_median"], cli["elapsed_s_median"])
+        self.assertIsNone(cli["workflow_s_median"])
+        self.assertEqual(cli["workflow_s_n"], 0)
+        self.assertIsNone(cli["estimated_subscription_usd_mean"])
+        self.assertEqual(cli["estimated_subscription_usd_n"], 0)
+        self.assertEqual(cli["token_basis"], "CLI 原生累计")
+        self.assertEqual(native["delivery_s_median"], native["answer_ready_s_median"])
+        self.assertEqual(native["observed_input_tokens_mean"], native["tree_input_tokens_mean"])
+        originals = {c["id"]: c for case in data["cases"] for c in case["conditions"]}
+        for row in overview["rows"]:
+            self.assertEqual(row["quality_mean"], originals[row["condition_id"]]["statistics"]["quality"]["mean"])
+            self.assertEqual(row["valid_n"], originals[row["condition_id"]]["valid_completed"])
+        self.assertIn("工程 CLI · Full Access", artifacts["compact.html"])
+        self.assertNotIn("固定材料 · 禁工具", artifacts["question-overview.html"])
+        exported = list(csv.DictReader(__import__('io').StringIO(artifacts["question-overview.csv"])))
+        self.assertEqual({r["condition_id"] for r in exported}, set(originals))
+
 
     def test_source_change_splits_comparability(self):
         first = self.make_run("one")

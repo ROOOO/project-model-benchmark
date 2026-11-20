@@ -58,7 +58,7 @@ const chartLabel=g=>{const b=String(g.batch??'');return `${g.model} · ${g.effor
 const maximum=(c,k)=>(c.dimension_maxima||c.weights||{})[k]??null;
 const stat=(g,k)=>g.statistics?.[k]||{n:0,mean:null,median:null,min:null,max:null};
 const value=(g,k,center='median')=>stat(g,k)[center]??null,n=g=>g.valid_completed??0;
-const executionLabel=c=>c.execution_mode==='project-readonly'?'工程只读 · 原生代理':'固定材料 · 禁工具';
+const executionLabel=c=>({'project-readonly':'工程只读 · 原生代理','project-full-access-cli':'工程 CLI · Full Access','project-readonly-cli':'工程 CLI · 受限','fixed-evidence':'固定材料 · 禁工具'}[c.execution_mode]||'未知执行模式');
 function safeURL(x){const s=String(x??'').trim(),canonical=s.replace(/[\u0000-\u0020\u007f]/g,'');return /^(?:https?:|file:)/i.test(canonical)||(!/^[a-z][a-z\d+.-]*:/i.test(canonical)&&!canonical.startsWith('//'))?s:'#'}
 function sourceLink(s){const label=s.label||s.batch||s.name||s.title||'来源';return s.url||s.href||s.report_url?`<a href="${esc(safeURL(s.url||s.href||s.report_url))}">${esc(label)}</a>`:esc(label)}
 function sourceCard(s){const e=s.evaluation||{},offline=e.mode==='offline-regrade',yesno=x=>x===true?'是':x===false?'否':'未知',base=`sources/${encodeURIComponent(s.id||'')}/`,link=(name,label)=>`<a href="${esc(base+name)}">${esc(label)}</a>`;

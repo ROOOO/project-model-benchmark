@@ -64,6 +64,10 @@ def subscription_metrics(record, pricing=None):
     """Price known responses individually, including mixed child models/speeds."""
     pricing = pricing if pricing is not None else _pricing()
     result = dict.fromkeys(SUBSCRIPTION_METRICS)
+    if record.get("runtime_backend") == "antigravity":
+        # OpenAI subscription weights and zero-child assumptions do not apply
+        # to native cumulative Antigravity usage.
+        return result
     snapshot = record.get("agentic")
     if not isinstance(snapshot, dict):
         tier = record.get("service_tier", record.get("effective", {}).get("serviceTier", "default"))
