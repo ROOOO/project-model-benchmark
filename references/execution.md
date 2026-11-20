@@ -57,7 +57,7 @@ case/
 }
 ```
 
-`gold.json` 必须有 `reference_facts`、`verification`、`rubric`。`verification` 记录实际执行或静态对照的方法、结果与可复核依据，不能写未运行的验证。rubric 每项有 `id / dimension / max / criterion`。新题默认声明 `scoring_version: 2`，dimension 为 `accuracy / coverage / insight / readability`，合计分别为50/20/10/20。未声明或明确为1时保持旧70/30，未知版本拒绝。具体事实、必答要点和可选推导随题目生成；洞察按实验方法的深度锚点细化，不按机制名称给分，不固定子项数量。不得把模型答案当标准答案。
+`gold.json` 必须有 `reference_facts`、`verification`、`rubric`。`verification` 记录实际执行或静态对照的方法、结果与可复核依据，不能写未运行的验证。rubric 每项有 `id / dimension / max / criterion`。新题默认声明正式 `scoring_version: 3`，dimension 为 `accuracy / coverage / insight`，合计分别为70/20/10，并冻结原则政策及核验点；`presentation_notes`不计分。历史V2仍为50/20/10/20，未声明或明确为1时保持旧70/30。退役试验格式只兼容读取，不新建；未知版本拒绝。具体事实、必答要点和可选推导随题目生成；洞察按实验方法的深度锚点细化，不按机制名称给分，不固定子项数量。不得把模型答案当标准答案。
 
 ```json
 {
@@ -133,6 +133,26 @@ benchmark.py validate --run-dir <run>
 若所有尝试都失败而没有可评分答案，跳过 blind/seal，用 `report --partial` 展示失败与缺口；不能生成质量排名。
 
 ## 已有答案离线重审
+
+正式V3的中立复核使用独立修订号，并封存复核前判断：
+
+```text
+benchmark.py regrade --run-dir <original-sampling-run> --rubric <review-gold.json> --review-from <sealed-formal-v3-run> --review-revision <revision-id> --condition-filter <selection.json> --output <new-review-directory>
+```
+
+随后按普通`blind / seal / report / validate`流程评分。`--review-from`与`--review-revision`必须成对，不能与原分采用或正文修复混用；细则须含相同`review_revision`。核对同一原采样协议、slot和答案／执行记录字节，保留三维权重、计分项、核验点ID／等级／归属及原则政策。复核前材料封存在`evaluation/review-source/`；它不替代原采样V2主对照。
+
+每份评分增加`review_audit`：封存旧判断、全部旧问题的保留／调整／撤销去向、每个基础计分项的前后值与原因，以及首轮独立记录封存哈希。`pre_review_quality`和`review_quality_delta`单列复核变化，`previous_quality`仍取原采样评分。先隐藏身份、旧分和旧标记通读全部答案，记录后再对照旧判断；披露既往身份暴露。不能把原来的`critical`标记直接当成核心错误。撤销问题时重新核对其基础分归属，避免只撤原则处罚。
+
+正式V3支持原分采用已封存的三维70/20/10判断：
+
+```text
+benchmark.py regrade --run-dir <original-sampling-run> --rubric <formal-v3-gold.json> --scores-from <sealed-three-dimension-revision> --condition-filter <selection.json> --output <new-formal-v3-directory>
+benchmark.py report --run-dir <new-formal-v3-directory>
+benchmark.py validate --run-dir <new-formal-v3-directory>
+```
+
+正式V3 rubric由`evaluation.formal_v3_gold`归一已封存的三维细则，不改变分值。`--scores-from`只用于原分采用，不能与正文修复联用；四维试验判断不能直接当作正式V3。校验原采样协议、slot、result和answer字节相同后，重新映射匿名编号，原样保留得分、证据、问题和核验点并自动封存；下一步直接report。内部派生来源复制至`evaluation/derivation-source/`，原采样评分保存在`evaluation/previous-summary.json`及`previous-grading/`，后者作为主对照。当前120份的`previous_scoring_version`为2，不被中间试验分数替代。本次没有新主观判断或模型调用；未提供`--scores-from`的普通离线重审仍逐份评阅。原四维同号试验包与原三维试验包保留只读兼容，按冻结细则维度与权重识别。
 
 ```text
 benchmark.py regrade --run-dir <original-run> --rubric <v2-gold.json> --output <new-sibling-directory>

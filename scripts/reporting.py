@@ -17,7 +17,7 @@ import subprocess
 from urllib.parse import quote, unquote, urlparse
 import zipfile
 
-from core import DIMENSION_LABELS, METRICS, all_attempts, check_inputs, check_sensitive, chosen_attempts, digest, distribution, inside, metric_keys, metrics_for_protocol, now, price_for, protocol_tiers, read, require, scoring_gold, scoring_weights, sha, usage_issues, validate_scores, write
+from core import DIMENSION_LABELS, METRICS, V3_METRICS, all_attempts, check_inputs, check_sensitive, chosen_attempts, digest, distribution, evaluation_schedule, inside, metric_keys, metrics_for_protocol, now, price_for, principle_score, protocol_tiers, read, require, score_sum, scoring_gold, scoring_weights, sha, three_dimension_scoring, usage_issues, validate_scores, write
 from runtime import still_running
 from billing import SUBSCRIPTION_LABEL, SUBSCRIPTION_METRICS, billing_context, format_usd, subscription_export, subscription_view
 
@@ -256,7 +256,7 @@ def idle(root):
 
 def settled_valid_answers(root, protocol):
     chosen = chosen_attempts(root)
-    require(set(chosen) == {s["id"] for s in protocol["schedule"]}, "Sampling not settled; finish/resume before anonymizing")
+    require(set(chosen) == {s["id"] for s in evaluation_schedule(root, protocol)}, "Sampling not settled; finish/resume before anonymizing")
     valid = {r["relative_result"]: r for r in chosen.values() if r.get("valid") and r.get("status") == "completed"}
     require(bool(valid), "No valid completed answers to grade")
     return valid
@@ -347,16 +347,23 @@ def blind(root, refresh=False):
         else:
             shutil.copyfile(source, destination)
         template[anon] = {"points": {r["id"]: None for r in rubric}, "notes": {r["id"]: "" for r in rubric}}
-        if gold.get("scoring_version", 1) == 2:
+        if gold.get("scoring_version", 1) >= 2:
             template[anon].update(evidence={r["id"]: [] for r in rubric}, issues=[])
+        if gold.get("scoring_version") in (3, 4):
+            template[anon]["checks"] = {c["id"]: {"status": None, "note": "", "evidence": []} for c in gold["checkpoints"]}
+        if three_dimension_scoring(gold):
+            template[anon]["presentation_notes"] = []
     if not (packet / "scores-template.json").exists():
         write(packet / "scores-template.json", template)
     (packet / "instructions.txt").write_text("只读取本 packet 的题面、gold 与匿名答案。逐项填写 points 和 notes；null 不是分数，不存在默认分数。评分前不读模型、性能、映射或运行结果。完成后用 seal 封存。这是 AI 辅助评分，不是人工偏好研究。\n", encoding="utf-8")
-    if gold.get("scoring_version", 1) == 2:
+    if gold.get("scoring_version", 1) >= 2:
         with (packet / "instructions.txt").open("a", encoding="utf-8") as f:
-            f.write("V2：准确性50/任务覆盖20/边界洞察10/可读性20。若有rubric.json，以其中细则评分，gold保留原始事实。每项填写evidence原文摘录；遗漏可留空摘录但需注明。issues逐项区分error/omission及critical/minor，错误需原文。错误扣准确性、遗漏扣覆盖，不重复扣；不以篇幅或术语数量奖励广度。\n")
+            weights_text = "正式V3：准确性70/任务覆盖20/边界洞察10，表达仅作非计分备注。" if three_dimension_scoring(gold) else "历史四维评分：准确性50/任务覆盖20/边界洞察10/可读性20。"
+            f.write(weights_text + "若有rubric.json，以其中细则评分，gold保留原始事实。每项填写evidence原文摘录；遗漏可留空摘录但需注明。issues逐项区分error/omission及critical/minor，错误需原文。错误扣准确性、遗漏扣覆盖，不重复扣；不以篇幅或术语数量奖励广度。\n")
             if p.get("offline_regrade"):
                 f.write("本次是事后补评，评分者此前见过模型身份。新编号与性能隐藏不能消除先验印象，不宣称完全独立盲评。\n")
+            if gold.get("scoring_version") in (3, 4):
+                f.write("V3：基础权重不变。逐项填写checks的correct/error/omission、依据和原文。每个issue填写check_id（扩展错误可为null）、group_id、impact_level(core/key/local)、reference和impact；必答点等级及归属以rubric.json冻结checkpoints为准。同因问题同组，错误与遗漏不重复处罚。程序计算额外原则扣分、封顶及最终分；比例仅辅助，不按回答篇幅计分。\n")
     check_packet(root)
     return {"packet": str(packet), "answers": len(mapping), "mapping_not_displayed": True, "archived_grading": str(archived) if archived else None}
 
@@ -371,13 +378,22 @@ def seal(root, scores_path):
     scores = read(scores_path)
     gold = scoring_gold(root)
     validate_scores(scores, mapping, grading / "packet", gold)
+    if (root / "evaluation/manifest.json").is_file() and read(root / "evaluation/manifest.json").get("review_source"):
+        from review import validate_review_scores
+        validate_review_scores(root, mapping, scores, gold)
+    if check_inputs(root).get("offline_regrade") and read(root / "evaluation/manifest.json").get("reweight"):
+        from evaluation import validate_reweighted_scores
+        validate_reweighted_scores(root, mapping, scores, gold)
+    if check_inputs(root).get("offline_regrade") and read(root / "evaluation/manifest.json").get("score_import"):
+        from evaluation import validate_imported_scores
+        validate_imported_scores(root, mapping, scores, gold)
     check_sensitive(json.dumps(scores, ensure_ascii=False))
     write(grading / "scores.json", scores)
     hashes = {p.relative_to(grading / "packet").as_posix(): sha(p) for p in (grading / "packet").rglob("*") if p.is_file() and p.name != "scores-template.json"}
     value = {"at": now(), "evaluator": "AI-assisted rubric scoring; model/effort and performance labels hidden. Not independent human preference research.",
              "scores_sha256": sha(grading / "scores.json"), "mapping_sha256": sha(grading / "private-mapping.json"), "packet_hashes": hashes, "answers_scored": len(scores)}
-    if gold.get("scoring_version", 1) == 2:
-        value.update(scoring_version=2, scoring_weights=scoring_weights(gold))
+    if gold.get("scoring_version", 1) >= 2:
+        value.update(scoring_version=gold["scoring_version"], scoring_weights=scoring_weights(gold))
         if check_inputs(root).get("offline_regrade"):
             value["evaluator"] = read(root / "evaluation/manifest.json")["note"] + " AI-assisted, no new inference."
     write(grading / "seal.json", value)
@@ -399,18 +415,32 @@ def score_data(root, partial=False):
     mapping, scores = check_packet(root), read(grading / "scores.json")
     gold = scoring_gold(root)
     rubric = validate_scores(scores, mapping, grading / "packet", gold)
+    if (root / "evaluation/manifest.json").is_file() and read(root / "evaluation/manifest.json").get("review_source"):
+        from review import validate_review_scores
+        validate_review_scores(root, mapping, scores, gold)
+    if check_inputs(root).get("offline_regrade") and read(root / "evaluation/manifest.json").get("reweight"):
+        from evaluation import validate_reweighted_scores
+        validate_reweighted_scores(root, mapping, scores, gold)
+    if check_inputs(root).get("offline_regrade") and read(root / "evaluation/manifest.json").get("score_import"):
+        from evaluation import validate_imported_scores
+        validate_imported_scores(root, mapping, scores, gold)
     weights = scoring_weights(gold)
-    if gold.get("scoring_version", 1) == 2:
-        require(seal_value.get("scoring_version") == 2 and seal_value.get("scoring_weights") == weights, "Sealed scoring version/weights differ")
+    if gold.get("scoring_version", 1) >= 2:
+        require(seal_value.get("scoring_version") == gold["scoring_version"] and seal_value.get("scoring_weights") == weights, "Sealed scoring version/weights differ")
     by_result = {}
     for anon, relative in mapping.items():
         points = scores[anon]["points"]
-        values = {dimension: sum(points[r["id"]] for r in rubric if r["dimension"] == dimension) for dimension in weights}
+        sum_values = score_sum if three_dimension_scoring(gold) else sum
+        values = {dimension: sum_values(points[r["id"]] for r in rubric if r["dimension"] == dimension) for dimension in weights}
         by_result[relative] = values | {"quality": sum(values.values()), "anonymous_id": anon}
-        if gold.get("scoring_version", 1) == 2:
+        if gold.get("scoring_version", 1) >= 2:
             issues = scores[anon]["issues"]
             by_result[relative].update(critical_errors=sum(x["kind"] == "error" and x["severity"] == "critical" for x in issues),
                                       errors=sum(x["kind"] == "error" for x in issues), omissions=sum(x["kind"] == "omission" for x in issues))
+        if gold.get("scoring_version") in (3, 4):
+            by_result[relative].update(principle_score(scores[anon], gold))
+        if three_dimension_scoring(gold):
+            by_result[relative]["presentation_notes"] = scores[anon]["presentation_notes"]
     return by_result, scores
 
 
@@ -424,6 +454,9 @@ def summarize(root, partial=False):
     agentic = execution_identity(p)[0] == "project-readonly"
     if agentic:
         metric_names = list(dict.fromkeys([*metric_names, *AGENTIC_METRICS]))
+    if version in (3, 4):
+        metric_names = list(dict.fromkeys([*metric_names, *V3_METRICS]))
+    schedule = evaluation_schedule(root, p)
     cost_key = "estimated_api_usd" if tiered else "estimated_standard_api_usd"
     attempts, chosen = all_attempts(root), chosen_attempts(root)
     rows, answers = [], []
@@ -435,8 +468,8 @@ def summarize(root, partial=False):
             row.update(service_tier=r["service_tier"], speed_mode=speed_mode(r["service_tier"]))
         row["selected"] = chosen.get(r["slot_id"], {}).get("relative_result") == r["relative_result"]
         row.update(scores.get(r["relative_result"], {}))
-        if version == 2:
-            row.update(scoring_version=2, **{k + "_max": v for k, v in weights.items()})
+        if version >= 2:
+            row.update(scoring_version=version, **{k + "_max": v for k, v in weights.items()})
         row["answer_link"] = (Path(r["relative_result"]).parent / "answer.txt").as_posix()
         rows.append(row)
         answers.append({"label": condition_label(row) + f" · r{r['repetition']} · attempt {r['attempt']} ({r['status']})", "text": inside(root, row["answer_link"]).read_text(encoding="utf-8"), "link": row["answer_link"]})
@@ -446,16 +479,23 @@ def summarize(root, partial=False):
     for model in p["models"]:
         for effort in p["efforts"]:
             for tier in protocol_tiers(p):
+                planned = sum(s["model"] == model and s["effort"] == effort and s.get("service_tier", "default") == tier for s in schedule)
+                if not planned:
+                    continue
                 all_rows = [r for r in rows if r["model"] == model and r["effort"] == effort and (not tiered or r["service_tier"] == tier)]
                 selected = [r for r in all_rows if r["selected"]]
                 good = [r for r in selected if r["valid"] and r["status"] == "completed"]
-                cells.append({"model": model, "effort": effort, "planned": p["repetitions"], "settled": len(selected), "valid_completed": len(good), "attempts": len(all_rows), "failed_attempts": sum(not r["valid"] for r in all_rows),
-                              "statistics": {k: distribution([r.get(k) for r in good]) for k in metric_names + list(weights) + ["quality"]}})
+                cells.append({"model": model, "effort": effort, "planned": planned, "settled": len(selected), "valid_completed": len(good), "attempts": len(all_rows), "failed_attempts": sum(not r["valid"] for r in all_rows),
+                              "statistics": {k: distribution([r.get(k) for r in good], decimal=three_dimension_scoring(gold) and k in [*weights, "quality", "raw_quality"]) for k in metric_names + list(weights) + ["quality"]}})
                 if tiered:
-                    cells[-1].update(service_tier=tier, speed_mode=speed_mode(tier), missing=p["repetitions"] - len(selected))
-                if version == 2:
+                    cells[-1].update(service_tier=tier, speed_mode=speed_mode(tier), missing=planned - len(selected))
+                if version >= 2:
                     cells[-1].update(critical_errors=sum(r.get("critical_errors", 0) for r in good),
                                      error_answers=sum(r.get("errors", 0) > 0 for r in good), omission_answers=sum(r.get("omissions", 0) > 0 for r in good))
+                if version in (3, 4):
+                    cells[-1].update(critical_omissions=sum(r.get("critical_omissions", 0) for r in good),
+                                     critical_error_answers=sum(r.get("critical_errors", 0) > 0 for r in good),
+                                     critical_omission_answers=sum(r.get("critical_omissions", 0) > 0 for r in good))
                 if agentic:
                     observed = [r for r in good if isinstance(r.get("delegation_occurred"), bool)]
                     cells[-1].update(delegation_observed_answers=len(observed),
@@ -466,7 +506,7 @@ def summarize(root, partial=False):
                                      observed_cost_coverage_attempts=sum(r.get("tree_observed_api_usd") is not None for r in all_rows))
     success = sum(c["valid_completed"] for c in cells)
     result = {"schema_version": 1, "generated_at": now(), "title": p["title"], "case_id": p["case_id"], "project": p["project"], "batch": root.name, "parent": p.get("parent"),
-            "planned": len(p["schedule"]), "settled": len(chosen), "valid_completed": success, "attempt_count": len(attempts), "all_planned_successful": success == len(p["schedule"]),
+            "planned": len(schedule), "settled": len(chosen), "valid_completed": success, "attempt_count": len(attempts), "all_planned_successful": success == len(schedule),
             "scores_sealed": (root / "grading/seal.json").exists(), "scope": p["scope"], "conditions": cells, "rows": rows, "answers": answers,
             "known_cost_usd": sum(r[cost_key] for r in rows if r.get(cost_key) is not None), "cost_coverage_attempts": sum(r.get(cost_key) is not None for r in rows),
             "observed_total_elapsed_s": sum(r["elapsed_s"] for r in rows if r.get("elapsed_s") is not None)}
@@ -484,13 +524,35 @@ def summarize(root, partial=False):
                       execution_profile_id=execution_identity(p, runtime_fingerprint(root))[1])
     if tiered:
         result.update(schema_version=2, service_tiers=protocol_tiers(p), tier_comparisons=tier_comparisons(cells, weights))
-    if version == 2:
-        result.update(schema_version=2, scoring_version=2, scoring_weights=weights,
+    if version >= 2:
+        result.update(schema_version=2, scoring_version=version, scoring_weights=weights,
                       grading_details={row["answer_link"]: detailed_scores[row["anonymous_id"]] for row in rows if row.get("anonymous_id")})
+        if version in (3, 4):
+            result.update(principle_policy=gold["principle_policy"], checkpoints=gold["checkpoints"])
         if p.get("offline_regrade"):
             manifest = read(root / "evaluation/manifest.json")
             previous = read(root / "evaluation/previous-summary.json")
+            if manifest.get("reweight"):
+                result["sampling_evaluation"] = {k: previous.get(k) for k in ("scoring_version", "scoring_weights", "conditions", "rows")}
+                previous = read(root / "evaluation/reweight-source/summary.json")
+            if "selected_slots" in manifest:
+                selected_ids = set(manifest["selected_slots"])
+                previous = {**previous, "rows": [r for r in previous["rows"] if r["slot_id"] in selected_ids]}
+                combinations = {(r["model"], r["effort"], r.get("service_tier", "default")) for r in previous["rows"]}
+                previous["conditions"] = [c for c in previous["conditions"] if (c["model"], c["effort"], c.get("service_tier", "default")) in combinations]
             result["evaluation"] = {k: manifest[k] for k in ["mode", "source_batch", "post_hoc", "evaluator_previously_saw_model_identity", "note"]}
+            if manifest.get("reweight"):
+                result["evaluation"]["reweight"] = manifest["reweight"]
+            if manifest.get("score_import"):
+                result["evaluation"]["score_import"] = manifest["score_import"]
+            if manifest.get("review_source"):
+                from review import review_quality_by_answer
+                prior_review = review_quality_by_answer(root)
+                result["evaluation"].update(review_source=manifest["review_source"], review_revision=manifest["review_revision"])
+                result["review_revision"] = manifest["review_revision"]
+                for row in rows:
+                    row.update(review_revision=manifest["review_revision"], pre_review_quality=prior_review[row["answer_link"]],
+                               review_quality_delta=score_sum([row["quality"], -prior_review[row["answer_link"]]]))
             if manifest.get("final_answer_repair"):
                 result["evaluation"]["final_answer_repair"] = manifest["final_answer_repair"]
                 result["evaluation"].update(new_inference_calls=0, costs_are_historical=True,
@@ -515,7 +577,7 @@ def summarize(root, partial=False):
                 old = old_rows[row["answer_link"]]
                 condition_keys = ["slot_id", "attempt", "model", "effort", "repetition", "status", "valid", "selected", "actual_gateway_charge"] + (["service_tier", "speed_mode"] if tiered else [])
                 changes = repair_changes.get(row["answer_link"], {})
-                for key in metric_names + condition_keys:
+                for key in [k for k in metric_names if k not in V3_METRICS] + condition_keys:
                     if key in changes:
                         require(old.get(key) == changes[key]["before"] and row.get(key) == changes[key]["after"],
                                 "Final repair metric differs from sealed provenance: " + key)
@@ -572,7 +634,8 @@ def fmt(x, digits=2):
 
 def condition_table(cells, weights=None):
     if weights is None:
-        weights = {"accuracy": 50, "coverage": 20, "insight": 10, "readability": 20} if cells and "coverage" in cells[0]["statistics"] else {"accuracy": 70, "readability": 30}
+        weights = ({"accuracy": 70, "coverage": 20, "insight": 10} if cells and "coverage" in cells[0]["statistics"] and "readability" not in cells[0]["statistics"]
+                   else {"accuracy": 50, "coverage": 20, "insight": 10, "readability": 20} if cells and "coverage" in cells[0]["statistics"] else {"accuracy": 70, "readability": 30})
     heads = ["组合", "有效/计划", "尝试/失败", *[DIMENSION_LABELS[k] + " /" + str(v) for k, v in weights.items()], "总分 /100", "耗时中位 s", "TTFT 中位 s", "可见 TPS 中位", "输出 token 均值", SUBSCRIPTION_LABEL]
     if "coverage" in weights:
         heads += ["关键错误数", "有错误/遗漏答案数"]
@@ -590,9 +653,17 @@ def condition_table(cells, weights=None):
     return '<div class="tablewrap"><table><thead><tr>' + "".join("<th>"+h+"</th>" for h in heads) + "</tr></thead><tbody>" + "".join(body) + "</tbody></table></div>"
 
 
-def render_csv(rows, version=1, service_tiers=None):
+def render_csv(rows, version=1, service_tiers=None, *, weights=None):
     output = io.StringIO(newline="")
-    fields = CSV_V2_FIELDS if version == 2 else CSV_FIELDS
+    fields = CSV_V2_FIELDS if version >= 2 else CSV_FIELDS
+    if any(r.get("review_revision") for r in rows):
+        fields = [*fields, "review_revision", "pre_review_quality", "review_quality_delta"]
+    if version in (3, 4):
+        fields = list(dict.fromkeys([*fields, *V3_METRICS, "principle_groups", "checkpoint_weight_total"]))
+    three_dimensions = (three_dimension_scoring({"weights":weights}) if weights is not None
+                        else version == 4 or (version == 3 and not any("readability" in row or "readability_max" in row for row in rows)))
+    if three_dimensions:
+        fields = [k for k in fields if k not in ("readability", "readability_max")] + ["presentation_notes"]
     if service_tiers is not None:
         fields = ["estimated_api_usd" if k == "estimated_standard_api_usd" else k for k in fields]
         fields = fields[:4] + ["service_tier", "speed_mode"] + fields[4:]
@@ -602,7 +673,7 @@ def render_csv(rows, version=1, service_tiers=None):
         fields = list(dict.fromkeys([*fields, *SUBSCRIPTION_METRICS, "billing_basis", "billing_unit", "billing_rules_as_of"]))
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for k, v in row.items()} for row in rows)
     return output.getvalue()
 
 
@@ -663,9 +734,15 @@ def report_context(root):
 
 def evaluation_html(data, context):
     """Versioned grading audit; original V1 rendering stays byte-compatible."""
-    if data.get("scoring_version", 1) != 2:
+    if data.get("scoring_version", 1) < 2:
         return "", "", ""
-    intro = '<p class="note">评分 V2：准确性50 / 任务覆盖20 / 边界洞察10 / 可读性20。关键事实错误优先于综合分审查；广度不按篇幅、术语数量或推理token计分。</p>'
+    version = data["scoring_version"]
+    weights_text = " / ".join(DIMENSION_LABELS[k] + str(v) for k,v in data["scoring_weights"].items())
+    intro = f'<p class="note">评分 V{version}：{weights_text}。关键事实错误优先于综合分审查；洞察不按篇幅、术语数量或推理token计分。</p>'
+    if three_dimension_scoring(data):
+        intro += '<p class="note">表达退出计分；presentation_notes只记录有原文依据的阅读障碍，不改变基础分或原则处罚。</p>'
+    if version in (3, 4):
+        intro += '<p class="note">最终分 = max(0, min(基础分 − 原则扣分, 适用最低上限))。一般实质错误最高89、关键子结论错误最高79、核心错误最高59；对应遗漏处罚更轻。加权错漏比例仅作辅助，分母为冻结核验点。</p>'
     if data.get("evaluation"):
         intro += '<p class="note">' + html.escape(data["evaluation"]["note"]) + '</p>'
         historical = data["evaluation"].get("historical_capability_verification")
@@ -680,18 +757,20 @@ def evaluation_html(data, context):
             comparison = '<h2>原评分（版本不同，单独展示）</h2><p>同一批答案；分数变化来自评分口径，不是模型能力变化。原评分版本 ' + str(old["scoring_version"]) + '</p>'
         comparison += condition_table(old["conditions"], old["scoring_weights"])
         old_rows = {r["answer_link"]: r for r in old["rows"]}
-        comparison += '<details><summary>逐份新旧总分对照</summary><div class="tablewrap"><table><tr><th>组合/轮次/尝试</th><th>原总分</th><th>V2总分</th></tr>'
+        comparison += f'<details><summary>逐份新旧总分对照</summary><div class="tablewrap"><table><tr><th>组合/轮次/尝试</th><th>原总分</th><th>V{version}总分</th></tr>'
         for r in data["rows"]:
             label = condition_label(r, "/") + f"/r{r['repetition']}/a{r['attempt']}"
             comparison += '<tr><td>'+html.escape(label)+'</td><td>'+fmt(old_rows[r["answer_link"]].get("quality"))+'</td><td>'+fmt(r.get("quality"))+'</td></tr>'
         comparison += '</table></div></details>'
-    audit = '<details><summary>V2细则、逐项评分依据与错误/遗漏</summary><pre>' + html.escape(json.dumps(context["scoring_gold"], ensure_ascii=False, indent=2)) + '</pre>'
+    audit = f'<details><summary>V{version}细则、逐项评分依据与错误/遗漏</summary><pre>' + html.escape(json.dumps(context["scoring_gold"], ensure_ascii=False, indent=2)) + '</pre>'
     for row in data["rows"]:
         score = data.get("grading_details", {}).get(row["answer_link"])
         if score is None:
             continue
         dimensions = " · ".join(f"{DIMENSION_LABELS[key]} {row[key]}/{weight}" for key, weight in data["scoring_weights"].items())
         audit += '<details><summary>' + html.escape(condition_label(row, "/") + f"/r{row['repetition']} · {dimensions} · 总分 {row['quality']}/100 · 关键错误 {row['critical_errors']}") + '</summary>'
+        if version in (3, 4):
+            audit += '<p>' + html.escape(f"基础分 {row['raw_quality']}；原则扣分 {row['principle_penalty']}；上限 {row['quality_cap']}；最终分 {row['quality']}；关键遗漏 {row['critical_omissions']}") + '</p><pre>' + html.escape(json.dumps({"groups": row["principle_groups"], "checks": score["checks"]}, ensure_ascii=False, indent=2)) + '</pre>'
         for item in context["scoring_gold"]["rubric"]:
             key = item["id"]
             audit += '<p><strong>' + html.escape(f"{key} · {DIMENSION_LABELS[item['dimension']]} {score['points'][key]}/{item['max']}") + '</strong> ' + html.escape(score["notes"][key]) + '</p>'
@@ -701,6 +780,8 @@ def evaluation_html(data, context):
             audit += '<p>' + html.escape(f"{issue['kind']}/{issue['severity']} · {issue['criterion']}：{issue['note']}") + '</p>'
             if issue.get("quote"):
                 audit += '<blockquote>' + html.escape(issue["quote"]) + '</blockquote>'
+        if three_dimension_scoring(data):
+            audit += '<p>表达备注（不计分）：' + html.escape(json.dumps(score["presentation_notes"], ensure_ascii=False)) + '</p>'
         audit += '</details>'
     return intro, comparison, audit + '</details>'
 
@@ -785,7 +866,7 @@ def build_report(root, partial=False):
     context = report_context(root)
     view = subscription_view(data, context["records"], context["billing_context"])
     page = render_html(data, context)
-    table = render_csv(view["rows"], data.get("scoring_version", 1), data.get("service_tiers"))
+    table = render_csv(view["rows"], data.get("scoring_version", 1), data.get("service_tiers"), weights=data.get("scoring_weights"))
     write(root / "summary.json", data)
     write(root / "subscription-prices.json", subscription_export(view))
     (root / "metrics.csv").write_text(table, encoding="utf-8-sig", newline="")
@@ -901,7 +982,7 @@ def validate(root, partial=False, *, write_receipt=False):
             csv_rows = list(csv.reader(f))
         context = report_context(root)
         view = subscription_view(expected, context["records"], context["billing_context"])
-        expected_csv = list(csv.reader(io.StringIO(render_csv(view["rows"], expected.get("scoring_version", 1), expected.get("service_tiers")), newline="")))
+        expected_csv = list(csv.reader(io.StringIO(render_csv(view["rows"], expected.get("scoring_version", 1), expected.get("service_tiers"), weights=expected.get("scoring_weights")), newline="")))
         require(csv_rows == expected_csv, "CSV differs from raw results: headers or rows")
         require(read(root / "subscription-prices.json") == subscription_export(view), "Subscription estimate differs from raw results")
         page = (root / "report.html").read_text(encoding="utf-8")
@@ -921,7 +1002,7 @@ def validate(root, partial=False, *, write_receipt=False):
             ui_check = {"passed": None, "reason": "Optional Node.js unavailable; HTML links/IDs checked by Python", "browser_visual_check": "not performed"}
         if write_receipt:
             write(root / "ui-check.json", ui_check)
-    value = {"at": now(), "passed": True, "attempts_checked": len(attempts), "planned_slots": len(p["schedule"]), "scores_sealed": (root / "grading/seal.json").exists(), "partial_report": partial, "no_new_inference": True}
+    value = {"at": now(), "passed": True, "attempts_checked": len(attempts), "planned_slots": len(evaluation_schedule(root, p)), "scores_sealed": (root / "grading/seal.json").exists(), "partial_report": partial, "no_new_inference": True}
     if write_receipt:
         write(root / "validation.json", value)
     return value

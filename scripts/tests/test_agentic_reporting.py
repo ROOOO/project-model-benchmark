@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -176,7 +177,6 @@ class AgenticReportingTests(unittest.TestCase):
         self.assertNotIn("固定材料 · 禁工具", artifacts["question-overview.html"])
         exported = list(csv.DictReader(__import__('io').StringIO(artifacts["question-overview.csv"])))
         self.assertEqual({r["condition_id"] for r in exported}, set(originals))
-
 
     def test_source_change_splits_comparability(self):
         first = self.make_run("one")
@@ -385,6 +385,26 @@ class AgenticReportingTests(unittest.TestCase):
         with zipfile.ZipFile(output / "comparison.zip") as bundle:
             self.assertTrue(any(name.endswith("capability/seal.json") for name in bundle.namelist()))
             self.assertTrue(any(name.endswith("capability/runs/0001/attempt-001/scratch/probe.cpp") for name in bundle.namelist()))
+        # Offline V3 review must preserve all bytes named by this native seal,
+        # including the original-encoding scratch probe, without new sampling.
+        from evaluation import regrade
+        from reporting import blind, build_report, seal, validate
+        from test_scoring_v3 import sample_score, v3_gold
+        rubric = self.base / "capability-v3.json"
+        core.write(rubric, v3_gold(core.read(root / "input/gold.json")))
+        revision = self.base / "capability-revision"
+        # Historical archive fixture; current entry points reject this retired scale.
+        with patch("evaluation.require_current_gold"):
+            regrade(root, rubric, revision)
+        blind(revision)
+        scores = {anon: sample_score() for anon in core.read(revision / "grading/private-mapping.json")}
+        score_path = self.base / "capability-v3-scores.json"
+        core.write(score_path, scores)
+        seal(revision, score_path)
+        reviewed = build_report(revision)
+        validate(revision)
+        self.assertEqual((revision / "capability/runs/0001/attempt-001/scratch/probe.cpp").read_bytes(), probe_bytes)
+        self.assertEqual(reviewed["capability_verification"], data["capability_verification"])
         receipt.update(paid_here=False, attempts=0, shared_attempts=1,
                        shared_from={"capability_id": identity, "compatibility_id": compatibility,
                                     "seal_sha256": "d" * 64, "root": "original-verification-source"})

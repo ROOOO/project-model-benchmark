@@ -56,10 +56,10 @@ class ComparisonTests(unittest.TestCase):
         seal(root, path)
         build_report(root)
 
-    def run_fixture(self, name, *, tiers=None, repetitions=1, failures=False, terminal_failure=False, unknown=False, version=1):
+    def run_fixture(self, name, *, tiers=None, efforts=None, repetitions=1, failures=False, terminal_failure=False, unknown=False, version=1):
         if version == 2:
             core.write(self.case / "gold.json", v2_gold(core.read(self.case / "gold.json")))
-        root = core.prepare(self.case, self.base / name, [core.MODELS[0]], ["max"], repetitions,
+        root = core.prepare(self.case, self.base / name, [core.MODELS[0]], efforts or ["max"], repetitions,
                             self.tier_prices if tiers else self.prices, service_tiers=tiers)
         protocol = core.check_inputs(root)
         for i, slot in enumerate(protocol["schedule"]):
@@ -117,6 +117,35 @@ class ComparisonTests(unittest.TestCase):
         page = (target / "report.html").read_text(encoding="utf-8")
         self.assertIn("中位数", page)
         self.assertIn("均值", page)
+
+    def test_exact_condition_filter_excludes_other_efforts_and_fast_without_resampling(self):
+        root = self.run_fixture("matrix", tiers=["default", "fast"], efforts=["xhigh", "max"])
+        before = snapshot(root)
+        selection = [{"model": core.MODELS[0], "effort": "max", "service_tier": "default"}]
+        path = self.base / "selection.json"
+        core.write(path, selection)
+        with patch("runtime.Server", side_effect=AssertionError("inference forbidden")):
+            _, data = self.output(root, condition_filter=path)
+        self.assertEqual(snapshot(root), before)
+        self.assertEqual(data["condition_filter"], selection)
+        self.assertEqual(data["counts"]["conditions"], 1)
+        self.assertEqual(data["counts"]["valid_answers"], 1)
+        self.assertEqual(data["counts"]["planned_slots"], 1)
+        self.assertEqual(data["source_batches"][0]["planned_slots"], 1)
+        self.assertEqual([(r["effort"], r["service_tier"]) for r in data["samples"]], [("max", "default")])
+        args = parser().parse_args(["compare", "--run-dirs", "a", "--output", "b", "--condition-filter", str(path)])
+        self.assertEqual(args.condition_filter, str(path))
+
+    def test_condition_filter_rejects_ambiguous_or_unmatched_selections(self):
+        root = self.run_fixture("matrix")
+        valid = {"model": core.MODELS[0], "effort": "max", "service_tier": "default"}
+        for index, value in enumerate(([], [valid, valid], [{"model": core.MODELS[0]}],
+                                       [{**valid, "service_tier": "fast"}], [{**valid, "effort": "xhigh"}])):
+            path = self.base / f"selection-{index}.json"
+            core.write(path, value)
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.output(root, name=f"invalid-{index}", condition_filter=path)
+            self.assertFalse((self.base / f"invalid-{index}").exists())
 
     def test_v2_zero_insight_and_unknown_cost_not_zero(self):
         root = self.run_fixture("v2", version=2, unknown=True)

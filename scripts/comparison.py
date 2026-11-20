@@ -8,9 +8,9 @@ from pathlib import Path
 import shutil
 import zipfile
 
-from core import (METRICS, check_inputs, check_sensitive, digest,
-                  distribution, inside, now, numeric, read, require, scoring_gold,
-                  scoring_weights, sha, write)
+from core import (METRICS, V3_METRICS, check_inputs, check_sensitive, condition_filter_keys, digest,
+                  distribution, evaluation_schedule, inside, now, numeric, read, require, scoring_gold,
+                  scoring_weights, score_sum, sha, three_dimension_scoring, write)
 from final_tps import ESTIMATE_FIELDS, estimate_final_tps, load_proxy_estimator
 from compact import compact_artifacts
 from billing import SUBSCRIPTION_METRICS, billing_context, subscription_metrics
@@ -20,7 +20,7 @@ from reporting import AGENTIC_FLAGS, AGENTIC_METRICS, check_artifact_sensitive, 
 DIMENSIONS = ("accuracy", "coverage", "readability", "insight")
 CANONICAL_METRICS = tuple(dict.fromkeys(
     "estimated_api_usd" if x == "estimated_standard_api_usd" else x for x in METRICS))
-STAT_FIELDS = tuple(dict.fromkeys(CANONICAL_METRICS + AGENTIC_METRICS + SUBSCRIPTION_METRICS)) + DIMENSIONS + ("quality",)
+STAT_FIELDS = tuple(dict.fromkeys(CANONICAL_METRICS + AGENTIC_METRICS + SUBSCRIPTION_METRICS + V3_METRICS)) + DIMENSIONS + ("quality", "previous_quality", "quality_delta")
 IDENTITY_FIELDS = ("case", "batch", "origin_batch_id", "execution_mode", "execution_profile_id", "model", "effort", "service_tier", "speed_mode")
 PAIR_FIELDS = ("case", "model", "effort", "kind", "standard_condition", "fast_condition",
                "standard_batch", "fast_batch", "standard_valid", "fast_valid",
@@ -133,11 +133,18 @@ def _source_id(index, root):
     return f"source-{index:03d}-{digest(str(root))[:8]}"
 
 
-def build_data(run_dirs, models=None, assessment=None, *, final_tps=None):
+def build_data(run_dirs, models=None, assessment=None, *, final_tps=None, condition_filter=None):
     """Reconstruct sealed summaries without source validation/report side effects."""
     roots = _paths(run_dirs)
     selected_models = set(models) if models is not None else None
     require(selected_models is None or bool(selected_models), "Model filter must not be empty")
+    require(models is None or condition_filter is None, "Use models or condition-filter, not both")
+    selection = read(condition_filter) if condition_filter is not None else None
+    selected_conditions, found_conditions = condition_filter_keys(selection), set()
+    def selected(value):
+        return ((selected_models is None or value["model"] in selected_models)
+                and (selected_conditions is None or (value["model"], value["effort"],
+                     value.get("service_tier", "default")) in selected_conditions))
     cases, sources, rows, failures, details = {}, [], [], [], {}
     identities, found_models = {}, set()
     for source_index, root in enumerate(roots, 1):
@@ -163,9 +170,10 @@ def build_data(run_dirs, models=None, assessment=None, *, final_tps=None):
         raw = {r["relative_result"]: r for r in records}
         source_rows = []
         for row in expected["rows"]:
-            if selected_models is not None and row["model"] not in selected_models:
+            if not selected(row):
                 continue
             found_models.add(row["model"])
+            found_conditions.add((row["model"], row["effort"], row.get("service_tier", "default")))
             relative_result = str(Path(row["answer_link"]).with_name("result.json").as_posix())
             record = raw[relative_result]
             identity = digest({"sampling_protocol": origin, "result": relative_result})
@@ -178,8 +186,20 @@ def build_data(run_dirs, models=None, assessment=None, *, final_tps=None):
             require(all(row.get(k) is None or numeric(row[k]) for k in CANONICAL_METRICS if k != "estimated_api_usd"),
                     "Invalid source metric")
             archive_answer = f"answers/{source_id}/{Path(relative_result).parent.as_posix()}/answer.txt"
-            item = {k: row.get(k) for k in (*CANONICAL_METRICS, *AGENTIC_METRICS, *AGENTIC_FLAGS, *DIMENSIONS, "quality", "slot_id", "attempt",
+            item = {k: row.get(k) for k in (*CANONICAL_METRICS, *AGENTIC_METRICS, *AGENTIC_FLAGS, *V3_METRICS, *DIMENSIONS, "quality", "slot_id", "attempt",
                                          "repetition", "status", "valid", "selected", "anonymous_id", "critical_errors", "errors", "omissions")}
+            if gold.get("scoring_version") in (3, 4):
+                item.update(principle_groups=row["principle_groups"], checkpoint_weight_total=row["checkpoint_weight_total"])
+                previous = expected.get("previous_evaluation", {}).get("rows", [])
+                item["previous_quality"] = next((r.get("quality") for r in previous if r["answer_link"] == row["answer_link"]), None)
+            if three_dimension_scoring(gold):
+                item.pop("readability", None)
+                item["presentation_notes"] = row["presentation_notes"]
+                item["previous_scoring_version"] = expected.get("previous_evaluation", {}).get("scoring_version")
+                item["quality_delta"] = (score_sum([item["quality"], -item["previous_quality"]])
+                                         if item["quality"] is not None and item["previous_quality"] is not None else None)
+            if expected.get("review_revision"):
+                item.update({k:row[k] for k in ("review_revision", "pre_review_quality", "review_quality_delta")})
             item.update(case=case_key, batch=root.name, source_id=source_id, origin_batch_id=origin,
                         execution_mode=execution_mode, execution_profile_id=execution_id,
                         model=row["model"], effort=row["effort"], service_tier=tier,
@@ -215,8 +235,7 @@ def build_data(run_dirs, models=None, assessment=None, *, final_tps=None):
                   "rubric_sha256": rubric_hash, "weights": weights, "evaluation": expected.get("evaluation"),
                   "protocol_sha256": sha(root / "protocol.json"), "scores_sha256": sha(root / "grading/scores.json"),
                   "prices_sha256": sha(root / "prices.json"), "price_as_of": read(root / "prices.json").get("as_of"),
-                  "planned_slots": sum(selected_models is None or s["model"] in selected_models
-                                       for s in protocol["schedule"]),
+                  "planned_slots": sum(selected(s) for s in evaluation_schedule(root, protocol)),
                   "valid_answers": sum(r["selected"] and r["valid"] and r["status"] == "completed" for r in source_rows),
                   "attempts": len(source_rows)}
         if expected.get("capability_verification") is not None:
@@ -229,16 +248,23 @@ def build_data(run_dirs, models=None, assessment=None, *, final_tps=None):
                                             "weights": weights, "dimension_maxima": weights,
                                             "conditions": [], "sources": []})
         case["sources"].append(source)
+        if expected.get("review_revision"):
+            case["review_revision"] = expected["review_revision"]
         for condition in expected["conditions"]:
-            if selected_models is not None and condition["model"] not in selected_models:
+            if not selected(condition):
                 continue
             tier = condition.get("service_tier", "default")
             condition_rows = [r for r in source_rows if (r["model"], r["effort"], r["service_tier"])
                               == (condition["model"], condition["effort"], tier)]
             good = [r for r in condition_rows if r["selected"] and r["valid"] and r["status"] == "completed"]
-            maxima = {k: weights.get(k) for k in DIMENSIONS}
+            maxima = {k: weights.get(k) for k in DIMENSIONS if not three_dimension_scoring(gold) or k != "readability"}
             fields = (*STAT_FIELDS, "estimated_final_text_tps", "estimated_final_text_tokens", "estimated_final_stream_s") if final_tps is not None else STAT_FIELDS
-            statistics = {k: distribution([r.get(k) for r in good]) for k in fields}
+            if expected.get("review_revision"):
+                fields = (*fields, "pre_review_quality", "review_quality_delta")
+            fields = [k for k in fields if not three_dimension_scoring(gold) or k != "readability"]
+            statistics = {k: distribution([r.get(k) for r in good],
+                           decimal=three_dimension_scoring(gold) and k in [*weights, "quality", "raw_quality", "previous_quality", "quality_delta", "pre_review_quality", "review_quality_delta"],
+                           signed=k in ("quality_delta", "review_quality_delta")) for k in fields}
             item = {"id": digest({"source": source_id, "model": condition["model"], "effort": condition["effort"], "tier": tier}),
                     "case": case_key, "batch": root.name, "origin_batch_id": origin,
                     "execution_mode": execution_mode, "execution_profile_id": execution_id,
@@ -247,14 +273,22 @@ def build_data(run_dirs, models=None, assessment=None, *, final_tps=None):
                     "settled": sum(r["selected"] for r in condition_rows), "valid_completed": len(good),
                     "attempts": len(condition_rows), "failed_attempts": sum(not r["valid"] for r in condition_rows),
                     "statistics": statistics, "rows": good, "dimension_maxima": maxima,
-                    "critical_errors": sum(r.get("critical_errors") or 0 for r in good) if gold.get("scoring_version", 1) == 2 else None,
-                    "error_answers": sum((r.get("errors") or 0) > 0 for r in good) if gold.get("scoring_version", 1) == 2 else None,
-                    "omission_answers": sum((r.get("omissions") or 0) > 0 for r in good) if gold.get("scoring_version", 1) == 2 else None,
+                    "critical_errors": sum(r.get("critical_errors") or 0 for r in good) if gold.get("scoring_version", 1) >= 2 else None,
+                    "error_answers": sum((r.get("errors") or 0) > 0 for r in good) if gold.get("scoring_version", 1) >= 2 else None,
+                    "omission_answers": sum((r.get("omissions") or 0) > 0 for r in good) if gold.get("scoring_version", 1) >= 2 else None,
                     "coverage_deduction_answers": sum(r["coverage"] < weights["coverage"] for r in good) if "coverage" in weights else None,
                     "accuracy_deduction_answers": sum(r["accuracy"] < weights["accuracy"] for r in good),
                     "ceiling_counts": {k: sum(r.get(k) == maximum for r in good) for k, maximum in weights.items()},
                     "known_cost_usd": sum(r["estimated_api_usd"] for r in condition_rows if r["estimated_api_usd"] is not None),
                     "cost_coverage_attempts": sum(r["estimated_api_usd"] is not None for r in condition_rows)}
+            if gold.get("scoring_version") in (3, 4):
+                item.update(critical_omissions=sum(r["critical_omissions"] for r in good),
+                            critical_error_answers=sum(r["critical_errors"] > 0 for r in good),
+                            critical_omission_answers=sum(r["critical_omissions"] > 0 for r in good))
+            if three_dimension_scoring(gold):
+                item["previous_scoring_version"] = expected.get("previous_evaluation", {}).get("scoring_version")
+            if expected.get("review_revision"):
+                item["review_revision"] = expected["review_revision"]
             observed_delegation = [r for r in good if isinstance(r.get("delegation_occurred"), bool)]
             item.update(delegation_observed_answers=len(observed_delegation),
                         delegated_answers=sum(r["delegation_occurred"] for r in observed_delegation),
@@ -266,6 +300,8 @@ def build_data(run_dirs, models=None, assessment=None, *, final_tps=None):
             case["conditions"].append(item)
     require(bool(rows), "No attempts match the selected models")
     require(selected_models is None or selected_models <= found_models, "Some selected models are absent from all source runs")
+    require(selected_conditions is None or selected_conditions <= found_conditions,
+            "Some selected conditions are absent from all source runs")
     values = list(cases.values())
     pairs, pairing_notes = fast_observations(values)
     result = {"schema_version": 1, "generated_at": now(), "title": "工程模型综合评测",
@@ -290,6 +326,8 @@ def build_data(run_dirs, models=None, assessment=None, *, final_tps=None):
                               "omission_answers": "原评分记录中的遗漏标记；不等于正式覆盖度扣分答案数。",
                               "fast_observations": "同批优先；跨批仅在一对候选唯一时显示历史观察；不逐次配对。"},
               "grading_details": details}
+    if selection is not None:
+        result["condition_filter"] = selection
     if final_tps is not None:
         result["final_tps_estimation"] = {**final_tps[1],
             "available_samples": sum(numeric(r.get("estimated_final_text_tps")) for r in rows),
@@ -315,7 +353,7 @@ def _csv(rows, fields):
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows({k: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v for k, v in row.items()} for row in rows)
     return output.getvalue()
 
 
@@ -328,7 +366,9 @@ def export_tables(data):
                                                 "accounting_complete_attempts", "known_cost_usd", "cost_coverage_attempts",
                                                 "known_observed_cost_usd", "observed_cost_coverage_attempts")})
             row.update(scoring_version=case["scoring_version"], rubric_sha256=case["rubric_sha256"])
-            row.update({k + "_max": case["weights"].get(k) for k in DIMENSIONS})
+            row.update({k + "_max": case["weights"].get(k) for k in DIMENSIONS if not three_dimension_scoring(case) or k != "readability"})
+            if "previous_scoring_version" in cell:
+                row["previous_scoring_version"] = cell["previous_scoring_version"]
             for key, statistics in cell["statistics"].items():
                 row.update({key + "_" + stat: value for stat, value in statistics.items()})
             conditions.append(row)
@@ -336,23 +376,31 @@ def export_tables(data):
     sample_fields = [*IDENTITY_FIELDS, "source_id", "slot_id", "attempt", "repetition", "status", "valid", "selected",
                      "anonymous_id", "attempt_identity", *DIMENSIONS, "quality", *CANONICAL_METRICS,
                       *AGENTIC_METRICS, *AGENTIC_FLAGS, *SUBSCRIPTION_METRICS,
+                      *V3_METRICS, "principle_groups", "checkpoint_weight_total",
+                      "previous_quality",
                       "billing_basis", "billing_unit", "billing_rules_as_of",
                      "critical_errors", "errors", "omissions", "actual_gateway_charge", "remote_completion",
                      "answer_sha256", "result_sha256", "answer_link", "source_answer_url"]
+    if all(three_dimension_scoring(c) for c in data["cases"]):
+        sample_fields = [k for k in sample_fields if k != "readability"]
+    if any(three_dimension_scoring(c) for c in data["cases"]):
+        sample_fields += ["presentation_notes", "previous_scoring_version", "quality_delta"]
     if data.get("final_tps_estimation"):
         sample_fields += list(ESTIMATE_FIELDS)
+    if any(c.get("review_revision") for c in data["cases"]):
+        sample_fields += ["review_revision", "pre_review_quality", "review_quality_delta"]
     return {"conditions.csv": _csv(conditions, condition_fields),
             "samples.csv": _csv(data["samples"], sample_fields),
             "fast-observations.csv": _csv(data["paired_speed_observations"], PAIR_FIELDS)}
 
 
-def compare(run_dirs, output, models=None, assessment=None, *, estimate_answer_tps=False):
+def compare(run_dirs, output, models=None, assessment=None, *, estimate_answer_tps=False, condition_filter=None):
     roots, output = _paths(run_dirs), Path(output).expanduser().resolve()
     require(not output.exists() and all(not output.is_relative_to(p) and not p.is_relative_to(output) for p in roots),
             "Use a new comparison output directory outside all source runs")
     final_tps = load_proxy_estimator() if estimate_answer_tps else None
     before = {str(p): fingerprint(p) for p in roots}
-    data = build_data(roots, models, assessment, final_tps=final_tps)
+    data = build_data(roots, models, assessment, final_tps=final_tps, condition_filter=condition_filter)
     template_path = Path(__file__).resolve().parent.parent / "assets/comparison.html"
     template = template_path.read_text(encoding="utf-8")
     require(template.count("__COMPARISON_DATA__") == 1, "Comparison template must contain one data marker")
@@ -371,9 +419,16 @@ def compare(run_dirs, output, models=None, assessment=None, *, estimate_answer_t
         source_files = ["protocol.json", "preparation-seal.json", "prices.json", "summary.json",
                         "grading/scores.json", "grading/seal.json", "grading/private-mapping.json"]
         source_files += [p.relative_to(root).as_posix() for p in (root / "input").rglob("*") if p.is_file()]
-        source_files += [name for name in ("evaluation/rubric.json", "evaluation/manifest.json", "evaluation/source-protocol.json", "permission-probe.json", "permission-probe-seal.json", "runtime.json", "preflight.json", "instruction-context.json")
+        source_files += [name for name in ("evaluation/rubric.json", "evaluation/manifest.json", "evaluation/source-protocol.json",
+                         "evaluation/source-preparation-seal.json", "evaluation/previous-summary.json",
+                         "evaluation/previous-grading/scores.json", "evaluation/previous-grading/seal.json",
+                         "evaluation/previous-grading/private-mapping.json", "evaluation/native-capability-supplement.json",
+                         "permission-probe.json", "permission-probe-seal.json", "runtime.json", "preflight.json", "instruction-context.json")
                          if (root / name).is_file()]
         source_files += [p.relative_to(root).as_posix() for p in native_evidence_files(root)]
+        source_files += [p.relative_to(root).as_posix() for p in (root / "evaluation/reweight-source").rglob("*") if p.is_file()]
+        source_files += [p.relative_to(root).as_posix() for p in (root / "evaluation/derivation-source").rglob("*") if p.is_file()]
+        source_files += [p.relative_to(root).as_posix() for p in (root / "evaluation/review-source").rglob("*") if p.is_file()]
         for name in source_files:
             original = inside(root, name)
             check_artifact_sensitive(original, original.is_relative_to(root / "input/source-snapshot") or "scratch" in original.relative_to(root).parts)

@@ -135,7 +135,9 @@ for (const c of cases) for (const effort of efforts) for (const sort of ['config
   eq(countRows(node('#crossCaseTable tbody').innerHTML), cases.reduce((sum, each) => sum +
     (each.conditions || []).filter(g => effort === 'all' || g.effort === effort).length, 0));
   const maxima = c.dimension_maxima || c.weights || {};
-  for (const key of dimensions) {
+  const weights = c.dimension_maxima || c.weights || {};
+  const threeDimensions = weights.accuracy === 70 && weights.coverage === 20 && weights.insight === 10 && !('readability' in weights);
+  for (const key of dimensions.filter(k => !threeDimensions || k !== 'readability')) {
     if (!finite(maxima[key])) ok(node('#qualityHead').innerHTML.includes('未知'), 'missing dimension must be unknown');
     else ok(node('#qualityHead').innerHTML.includes('/ ' + maxima[key]), 'original scale missing');
   }

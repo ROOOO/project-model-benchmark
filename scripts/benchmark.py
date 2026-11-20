@@ -50,11 +50,16 @@ def parser():
     revision.add_argument("--run-dir", required=True)
     revision.add_argument("--rubric", required=True)
     revision.add_argument("--output", required=True)
+    revision.add_argument("--condition-filter", help="JSON list selecting existing model/effort/service_tier conditions for offline grading")
+    revision.add_argument("--scores-from", help="Adopt sealed 70/20/10 judgments unchanged into formal V3; compare original sampling grades, no inference")
+    revision.add_argument("--review-from", help="Archive the pre-review formal V3 judgments for a fresh review of the same answers")
+    revision.add_argument("--review-revision", help="Frozen review revision ID; requires --review-from")
     revision.add_argument("--repair-final-answers", action="store_true", help="Re-extract canonical completed finals from archived native events; no model calls")
     comparison = sub.add_parser("compare", help="Create a separate offline comparison from sealed runs; never starts inference")
     comparison.add_argument("--run-dirs", nargs="+", required=True)
     comparison.add_argument("--output", required=True)
     comparison.add_argument("--models", nargs="+")
+    comparison.add_argument("--condition-filter", help="JSON list of exact model/effort/service_tier selections; offline only")
     comparison.add_argument("--assessment", help="JSON with conclusion, evidence and limitations; omitted uses neutral notes")
     comparison.add_argument("--estimate-answer-tps", action="store_true", help="Estimate final text TPS with a pinned, preloaded local o200k_base proxy")
     adoption = sub.add_parser("adopt-smoke", help="Reuse verified capability checks across identical study environments; no inference")
@@ -139,12 +144,19 @@ def main(argv=None):
     elif args.command == "inventory":
         value = inventory(root=args.root, run_dirs=args.run_dirs)
     elif args.command == "regrade":
-        value = regrade(args.run_dir, args.rubric, args.output, repair_final_answers=args.repair_final_answers)
+        options = {"condition_filter": args.condition_filter} if args.condition_filter else {}
+        if args.scores_from:
+            options["scores_from"] = args.scores_from
+        if args.review_from or args.review_revision:
+            options.update(review_from=args.review_from, review_revision=args.review_revision)
+        value = regrade(args.run_dir, args.rubric, args.output, repair_final_answers=args.repair_final_answers, **options)
     elif args.command == "compare":
+        options = {}
         if args.estimate_answer_tps:
-            value = compare(args.run_dirs, args.output, args.models, args.assessment, estimate_answer_tps=True)
-        else:
-            value = compare(args.run_dirs, args.output, args.models, args.assessment)
+            options["estimate_answer_tps"] = True
+        if args.condition_filter:
+            options["condition_filter"] = args.condition_filter
+        value = compare(args.run_dirs, args.output, args.models, args.assessment, **options)
     elif args.command == "adopt-smoke":
         from agentic_runtime import adopt_capability
         value = adopt_capability(args.run_dir, args.source)
