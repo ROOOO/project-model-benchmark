@@ -278,6 +278,39 @@ def compact_artifacts(data, source_sha256, cli_versions=None):
     return result
 
 
+def _matrix_dimensions(row, topic):
+    esc = lambda value: html.escape(str(value), quote=True)
+    scales = dimensions(topic)
+    parts = [f'<div class="dimension-scores current-only" style="--dimension-count:{len(scales)}" aria-label="基础评分维度">']
+    for key, label in scales:
+        maximum = topic.get("dimension_maxima", {}).get(key)
+        parts.append(f'<div data-dimension="{key}"><span class="dimension-label">{esc(label)}</span>'
+                     f'<span class="dimension-value">{_number(row.get(key + "_mean"))}</span>'
+                     f'<small class="dimension-maximum">/{_number(maximum, 0)}</small></div>')
+    return ''.join(parts) + '</div>'
+
+
+def _matrix_history(row):
+    lines = []
+    if row.get("previous_scoring_version") or row.get("previous_quality_mean") is not None:
+        lines.append('<small class="previous">' + html.escape(_previous(row)) + '</small>')
+    if row.get("review_revision"):
+        lines.append(_review_previous(row).removeprefix('<br>'))
+    return '<div class="history-scores history-only">' + (''.join(lines) or '<small>暂无历史评分</small>') + '</div>'
+
+
+def _matrix_mean_dimensions(rows, topics):
+    scales = [topic.get("dimension_maxima", {}) for topic in topics]
+    if not scales or any(scale != scales[0] for scale in scales):
+        return '<div class="current-only muted">维度量表不同，见各题</div>'
+    values = {}
+    for key, _ in dimensions(topics[0]):
+        entries = [row.get(key + "_mean") for row in rows]
+        values[key + "_mean"] = (sum(Decimal(str(value)) for value in entries) / len(entries)
+                                  if entries and all(value is not None for value in entries) else None)
+    return _matrix_dimensions(values, topics[0])
+
+
 def render_principle_matrix(overview, data):
     """Static first view: no script is needed to see scores, time or issues."""
     esc = lambda v: html.escape(str(v), quote=True)
@@ -292,7 +325,22 @@ def render_principle_matrix(overview, data):
     conditions = {c["id"]: c for t in data["cases"] for c in t["conditions"]}
     parts = ['''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>V3 四题紧凑评分报告</title><style>
 *{box-sizing:border-box}body{margin:0;background:#11151d;color:#edf1f8;font:15px/1.6 system-ui,"Microsoft YaHei",sans-serif}main{max-width:1300px;margin:auto;padding:28px 22px 50px}h1{font-size:27px;margin:0 0 7px}h2{font-size:20px;margin:24px 0 9px}p{margin:8px 0}small,.muted{color:#a4afc2}a{color:#9dc5ff}.panel{background:#1b212c;border:1px solid #333d4c;border-radius:11px;padding:16px 18px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}th,td{border-bottom:1px solid #333d4c;text-align:center;padding:11px 13px;vertical-align:middle}th{background:#222a37}th:first-child,td:first-child{text-align:left}th small{display:block;font-size:11px;font-weight:400}.matrix{min-width:1040px}.score{font-size:21px;font-weight:650}.time{font-size:14px;color:#a4afc2;margin-left:5px}.badge{display:block;font-size:11px;margin-top:4px}.risk{background:rgba(236,134,72,.10)}.danger{color:#ffbd91}.summary{background:#222a37;font-weight:650}.note{border-left:3px solid #ffbd91;padding:10px 14px;background:#29251f;margin:16px 0;font-size:14px}details{border-top:1px solid #333d4c;margin-top:13px;padding-top:11px}summary{cursor:pointer;color:#9dc5ff}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}blockquote{font-size:13px;color:#c7d1e2;border-left:2px solid #526174;padding-left:12px}.audit td,.audit th{font-size:12px;padding:7px 10px}.footer{font-size:12px;color:#a4afc2;margin-top:18px}@media(max-width:700px){main{padding:18px 12px}h1{font-size:23px}}</style></head><body><main><h1>V3 四题紧凑评分报告</h1>
-<p class="muted">每格：最终分 / 分钟。每题每配置 n=5；先逐份应用原则扣分与封顶，再统计均分。分数取均值，时长取中位数。</p><p><a href="question-overview.csv">CSV</a> · <a href="comparison-data.json">完整 JSON</a> · <a href="report.html">完整综合报告</a> · <a href="comparison.zip">结果包</a></p><div class="panel scroll"><table class="matrix"><thead><tr><th>题目</th>''']
+<p class="muted">每格：最终分 / 分钟。每题每配置 n=5；先逐份应用原则扣分与封顶，再统计均分。分数取均值，时长取中位数。</p><p><a href="compact.html">原紧凑版</a> · <a href="question-overview.html">逐题汇总版</a> · <a href="question-overview.csv">CSV</a> · <a href="comparison-data.json">完整 JSON</a> · <a href="report.html">完整综合报告</a> · <a href="comparison.zip">结果包</a></p>''']
+    parts.append('''<style>
+.view-radio{position:absolute;width:1px;height:1px;opacity:0}.view-switch{display:flex;gap:4px;margin:12px 0;padding:4px;width:fit-content;border:1px solid #404b5c;border-radius:8px;background:#1b212c}.view-switch label{padding:5px 13px;border-radius:5px;cursor:pointer;color:#a4afc2;font-size:13px}
+#scores-current:checked~.view-switch label[for="scores-current"],#scores-history:checked~.view-switch label[for="scores-history"]{background:#33435d;color:#fff}
+#scores-current:focus-visible~.view-switch label[for="scores-current"],#scores-history:focus-visible~.view-switch label[for="scores-history"]{outline:2px solid #9dc5ff;outline-offset:2px}
+#scores-history:disabled~.view-switch label[for="scores-history"]{opacity:.45;cursor:default}.score-slot{height:44px;margin-top:5px;display:flex;align-items:center;justify-content:center}.dimension-scores{display:grid;grid-template-columns:repeat(var(--dimension-count),minmax(0,1fr));gap:5px;width:100%}.dimension-scores>div{white-space:nowrap;line-height:18px}.dimension-label{display:block;font-size:10px;font-weight:400;color:#a4afc2}.dimension-value{font-size:12px;font-weight:650}.dimension-maximum{font-size:10px;font-weight:400}.history-scores{width:100%;font-size:12px;line-height:20px}.history-scores small{display:block;font-size:12px;white-space:nowrap}.history-only{display:none}
+#scores-history:checked~.view-content .current-only{display:none}#scores-history:checked~.view-content .history-only{display:block}#scores-history:checked~.view-content .audit th.history-only,#scores-history:checked~.view-content .audit td.history-only{display:table-cell}.history-audit{font-weight:400}.matrix .summary .score-slot{margin-top:8px}
+</style>''')
+    has_history = any(row.get("previous_scoring_version") or row.get("review_revision")
+                      or row.get("previous_quality_mean") is not None for row in overview["rows"])
+    disabled = '' if has_history else ' disabled title="本报告无历史评分"'
+    parts.append('<div class="score-view"><input class="view-radio" id="scores-current" type="radio" name="score-view" aria-label="仅看本轮" checked>'
+                 '<input class="view-radio" id="scores-history" type="radio" name="score-view" aria-label="显示历史对照"' + disabled + '>'
+                 '<div class="view-switch" role="group" aria-label="分数显示方式"><label for="scores-current">仅看本轮</label>'
+                 '<label for="scores-history">显示历史对照</label></div><div class="view-content">'
+                 '<div class="panel scroll"><table class="matrix"><thead><tr><th>题目</th>')
     for model, effort, tier in columns:
         mode = "Full Access" if model.startswith("gemini-") else ("Fast" if tier == "priority" else "Standard")
         parts.append(f'<th>{esc(names.get(model, model))}<small>{esc(effort)} · {esc(mode)}</small></th>')
@@ -307,7 +355,8 @@ def render_principle_matrix(overview, data):
                 continue
             errors, omissions = r.get("error_answers", 0), r.get("omission_answers", 0)
             css = ' class="risk"' if errors or omissions else ''
-            parts.append(f'<td{css} data-condition="{esc(r["condition_id"])}"><span class="score">{_number(r["quality_mean"], 2)}</span><span class="time">/ {_number(r["delivery_s_median"] / 60 if r["delivery_s_median"] is not None else None)}</span><span class="badge danger">错 {errors}/{r["valid_n"]} · 漏 {omissions}/{r["valid_n"]}</span><small class="previous">{esc(_previous(r))}</small>{_review_previous(r)}</td>')
+            parts.append(f'<td{css} data-condition="{esc(r["condition_id"])}"><span class="score">{_number(r["quality_mean"], 2)}</span><span class="time">/ {_number(r["delivery_s_median"] / 60 if r["delivery_s_median"] is not None else None)}</span><span class="badge danger">错 {errors}/{r["valid_n"]} · 漏 {omissions}/{r["valid_n"]}</span>'
+                         '<div class="score-slot">' + _matrix_dimensions(r, topic) + _matrix_history(r) + '</div></td>')
         parts.append('</tr>')
     parts.append('<tr class="summary" data-summary="mean"><th>四题等权均值</th>')
     for column in columns:
@@ -316,19 +365,21 @@ def render_principle_matrix(overview, data):
         if complete:
             mean_quality = (sum(Decimal(str(r["quality_mean"])) for r in rs) / len(rs)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             mean_minutes = sum(r["delivery_s_median"] for r in rs) / len(rs) / 60
-            previous = ""
+            history = {**rs[0], "previous_quality_mean":None, "quality_delta_mean":None,
+                       "pre_review_quality_mean":None, "review_quality_delta_mean":None}
             if all(r.get("previous_quality_mean") is not None for r in rs):
                 old = sum(Decimal(str(r["previous_quality_mean"])) for r in rs) / len(rs)
                 current = sum(Decimal(str(r["quality_mean"])) for r in rs) / len(rs)
-                previous = '<br><small class="previous">' + esc(_previous({**rs[0], "previous_quality_mean":old, "quality_delta_mean":current - old})) + '</small>'
+                history.update(previous_quality_mean=old, quality_delta_mean=current-old)
             if all(r.get("pre_review_quality_mean") is not None for r in rs):
                 pre = sum(Decimal(str(r["pre_review_quality_mean"])) for r in rs) / len(rs)
                 current = sum(Decimal(str(r["quality_mean"])) for r in rs) / len(rs)
-                previous += _review_previous({**rs[0], "pre_review_quality_mean":pre, "review_quality_delta_mean":current-pre})
-            parts.append(f'<td><span class="score">{mean_quality:.2f}</span><span class="time"> / {mean_minutes:.1f}</span>{previous}</td>')
+                history.update(pre_review_quality_mean=pre, review_quality_delta_mean=current-pre)
+            parts.append(f'<td><span class="score">{mean_quality:.2f}</span><span class="time"> / {mean_minutes:.1f}</span><div class="score-slot">'
+                         + _matrix_mean_dimensions(rs, overview["topics"]) + _matrix_history(history) + '</div></td>')
         else:
             parts.append('<td>—</td>')
-    parts.append('</tr></tbody></table></div><p class="muted"><small>错/漏统计含相应问题的答案数；同一份可同时出现不同问题。原分是同一答案的历史评分，仅作对照。四题均值只描述本组样本，时长列为四题中位数的均值。</small></p>')
+    parts.append('</tr></tbody></table></div><p class="muted"><small>维度数值为基础评分均值，斜线后为各项满分；最终分另受原则扣分和封顶影响，可能低于维度之和。错/漏统计含相应问题的答案数；同一份可同时出现不同问题。<span class="history-only">原分是同一答案的历史评分，仅作对照。</span>四题均值只描述本组样本，时长列为四题中位数的均值。</small></p>')
     assessment = data.get("assessment") or {}
     parts.append('<div class="note">' + esc(assessment.get("conclusion") or "先看错误与遗漏，再比较最终分和时间；不同执行条件保持独立。") + '</div>')
     parts.append('<section class="panel"><h2>原则规则与分数构成</h2><p>基础分：准确性50 + 覆盖20 + 洞察10 + 表达20。最终分 = max(0, min(基础分 − 原则扣分, 最低适用上限))。</p><div class="scroll"><table><tr><th>影响</th><th>错误：额外扣分 / 上限</th><th>遗漏：额外扣分 / 上限</th></tr><tr><td>核心结论</td><td>25 / 59</td><td>15 / 69</td></tr><tr><td>关键子结论</td><td>10 / 79</td><td>6 / 84</td></tr><tr><td>一般实质问题</td><td>3 / 89</td><td>2 / 100</td></tr></table></div><p class="muted"><small>同因问题只罚一次；同因的错误和下游遗漏不叠罚。核验点重要性权重3/2/1只计算辅助错漏比例，不能用多写正确句子稀释处罚。未提出可选洞察不算遗漏。</small></p>')
@@ -337,12 +388,12 @@ def render_principle_matrix(overview, data):
         for r in (r for r in overview["rows"] if r["question_id"] == topic["id"]):
             c = conditions[r["condition_id"]]
             old_label = f'V{r["previous_scoring_version"]}分' if r.get("previous_scoring_version") else "原分"
-            parts.append('<details><summary>' + esc(names.get(r["model"], r["model"])) + '</summary><div class="scroll"><table class="audit"><tr><th>样本</th><th>' + esc(old_label) + '</th><th>基础分</th><th>原则扣分</th><th>上限</th><th>最终分</th><th>差值</th><th>错误率 / 遗漏率（辅助）</th></tr>')
+            parts.append('<details><summary>' + esc(names.get(r["model"], r["model"])) + '</summary><div class="scroll"><table class="audit"><tr><th>样本</th><th class="history-only">' + esc(old_label) + '</th><th>基础分</th><th>原则扣分</th><th>上限</th><th>最终分</th><th class="history-only">差值</th><th>错误率 / 遗漏率（辅助）</th></tr>')
             for s in c["rows"]:
                 values = [s["anonymous_id"], _number(s.get("previous_quality")), _number(s["raw_quality"]),
                           _number(s["principle_penalty"]), _number(s["quality_cap"]), _number(s["quality"]), _number(s.get("quality_delta"), 2),
                           f'{s["weighted_error_rate"]:.1%} / {s["weighted_omission_rate"]:.1%}']
-                parts.append('<tr>' + ''.join('<td>' + esc(v) + '</td>' for v in values) + '</tr>')
+                parts.append('<tr>' + ''.join(('<td class="history-only">' if index in (1,6) else '<td>') + esc(v) + '</td>' for index,v in enumerate(values)) + '</tr>')
             parts.append('</table></div>')
             for s in c["rows"]:
                 detail = data["grading_details"][s["attempt_identity"]]["scores"]
@@ -351,9 +402,11 @@ def render_principle_matrix(overview, data):
                 if three_dimension_scoring(topic):
                     audit["presentation_notes"] = detail["presentation_notes"]
                 if detail.get("review_audit"):
-                    audit["review_audit"] = detail["review_audit"]
                     audit["review_notes"] = detail.get("review_notes", [])
                 parts.append('<pre>' + esc(json.dumps(audit, ensure_ascii=False, indent=2)) + '</pre>')
+                if detail.get("review_audit"):
+                    parts.append('<details class="history-audit"><summary>历史评分审计（含旧判断）</summary><pre>'
+                                 + esc(json.dumps({"review_audit":detail["review_audit"]}, ensure_ascii=False, indent=2)) + '</pre></details>')
                 for issue in detail["issues"]:
                     parts.append('<p>' + esc(f'{issue["kind"]} / {issue["impact_level"]} / {issue["group_id"]}：{issue["note"]}；正确依据：{issue["reference"]}；影响：{issue["impact"]}') + '</p>')
                     if issue.get("quote"):
@@ -364,7 +417,7 @@ def render_principle_matrix(overview, data):
     parts.append('</section><footer class="footer">')
     for text in [*(assessment.get("limitations") or []), "AI事后重评；评分者此前见过模型身份，非独立人工盲评。零新增采样，费用与执行用量沿用原记录，未知仍未知。", "历史Codex为max/工程只读，计请求至答案交付；Neon为Extra/xhigh/Full Access，计CLI启动至退出，包含启动开销。"]:
         parts.append('<p>' + esc(text) + '</p>')
-    parts.append('</footer></main></body></html>')
+    parts.append('</footer></div></div></main></body></html>')
     result = ''.join(parts)
     if version == 4:
         result = result.replace("V3 四题紧凑评分报告", "V4 四题紧凑评分报告")
