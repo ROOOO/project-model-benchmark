@@ -224,6 +224,28 @@ AGY引用兼容`peer_run_ids`字符串／对象列表及`peer_runs`回执列表�
 
 新评分包位于随机`blind-packets/<标识>`，评分聊天标题与工作目录同样只使用随机标识，不把源模型序号、原稿/A/B身份或协调端grade位置放进评分者可见路径。私有state保留对应关系；历史`grades/<位置>/packet`仍兼容读取。结果包同时保留原采样性能字节、试跑复用正文和采集证明，便于脱离本机目录核对来源。
 
+### 双模型独立复查
+
+用户明确选择两个模型独立修订同一批底稿时，沿用`paired-*`，不套用B组必须取得peer分析的约束：
+
+```text
+benchmark.py paired-prepare --design independent-reviewers --source-model <原稿模型> --reviewers <两臂JSON> --selection <封存选择清单> --comparison <V3对照目录> --previous-batch <已完成A/B批次> --batch-dir <新目录>
+```
+
+两臂JSON为顺序`a/b`的列表，每项含`arm/label/model/effort/backend`；backend为`app`或`antigravity`。本模式不采用pilot；旧matched-ab默认流程仍要求pilot。协议分开记录原稿模型和复查模型、实际后端、独立会话及源码哈希。当前四题各5份底稿构成20对、40份修订、60份同轮评分；不重新生成原稿。
+
+`paired-next`先持久化启动意图。App沿用`paired-register/paired-collect`；CLI由`paired-run-cli --unit <位置>`启动独立Full Access会话，使用逐份`--new-project`及scratch，原生参数与权限回执分别保留。`paired-reconcile-cli`只核实已有尝试；缺终态保持在途，不能因进程退出或轮询静默重发。`paired-retry`仅接受已有明确失败终态，所有尝试保留；成功非空答复无论质量如何均不得重跑。无新模型替换或额外credits授权。
+
+App来源仍为`app-final-answer-v1`；CLI为独立的`antigravity-terminal-v1`，绑定`result.response`、模型、会话、用量、权限、事件及原文字节，不生成伪App回执。匿名包同时存在两类新来源时使用`mixed-final-answer-v1`校验策略，封存与导出均重新验证原生来源，旧包保持原规则。
+
+两组只读相同的题面、冻结源码与唯一指定底稿的脱敏视图，不互读结果、不调用其他模型、子代理、联网或Computer Use。干净CLI运行区位于历史目录外，避免把授权底稿读取误报为评分污染；禁止读取其他历史和评分资料，原文及可回溯路径替换记录保留。
+
+本次授权为Astra/max最多2路、Neon Extra/xhigh最多5路；无跨任务生成锁，保留逐份在途保护，额度保留线为0且不更改全局默认。四个评分对话可并发，统一6.1 Sol/max，每题15份。全部封存后才揭示原稿/修订身份与旧分；当前覆盖645个计分项、1020个核验点，原处罚和权重不变。
+
+`paired-report`按实际设计导出紧凑HTML、CSV、JSON、ZIP，展示两种独立修订及原稿对照、配对差值、错漏、证据与原生性能。污染样本单独标记、保留评分、排除干净统计。上一组300份评分只读引用，不合并排名；App/CLI后端及计量差异、额外计算、事后V3标准和AI评分局限必须披露。
+
+用户提示AGY新增可委派Codex的skill时，可用批次`sampling-hold.json`暂停指定臂的新启动，已在途先核实。不要把`--disable-slash-commands`当成关闭自动技能发现的证明；它仅禁止斜杠扩展。独立任务禁止使用该skill，并审计实际skill/脚本访问、Codex命令与子代理事件。用户明确要求受影响样本作废时，保留匹配原生证据及原答复，标记`invalidated`后才允许追加干净尝试，不能因此重跑正常但低分的答案。现有codex-peer脚本支持防递归环境标记时，可仅给本次CLI进程设置并先做零模型调用校验；此举不移除全局规则/技能，也不证明后台终端继承环境，不代替原生调用审计。将生效位置、首批未带标记位置和检查局限封存到`independence-override.json`。
+
 ### 全新按题盲评
 
 `blind-topic --entries-json <entries.json> --rubric <formal-v3.json> --packet <clean-directory> --private-mapping <outside-packet.json>`生成单题多批匿名包。entries为列表，每项含稳定`identity`、冻结批次`source`、原答案`answer`和`answer_sha256`，可附原slot／result来源。题面及prompt必须一致。原文不改；视图仅替换来源路径前缀，私有映射记录替换区间和原文／视图哈希。引用导回原文时通过区间回溯，不能直接把脱敏文本覆盖原答案。

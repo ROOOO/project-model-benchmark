@@ -146,9 +146,10 @@ def prepare_topic(entries, gold_path, packet, private_mapping):
         '全部完成后运行python -X utf8 review_io.py seal封存，封存后不再修改。中断后读取progress.json续做，不能重置完成项。\n', encoding='utf-8')
     files = {p.relative_to(packet).as_posix():sha(p) for p in packet.rglob('*') if p.is_file()}
     input_seal = {'at':now(), 'review_protocol':REVIEW_PROTOCOL, 'answers':len(mapping), 'files_sha256':files}
-    if any(entry.get('answer_receipt') for entry in entries):
+    if any(entry.get('answer_receipt') or entry.get('cli_answer_receipt') for entry in entries):
         # A single opaque mapping hash binds sources without revealing which label is the App sample.
-        input_seal['source_validation'] = {'policy':'app-final-answer-v1', 'mapping_sha256':sha(private_mapping)}
+        policy = 'mixed-final-answer-v1' if any(entry.get('cli_answer_receipt') for entry in entries) else 'app-final-answer-v1'
+        input_seal['source_validation'] = {'policy':policy, 'mapping_sha256':sha(private_mapping)}
     write(packet/'input-seal.json', input_seal)
     write(packet/'progress.json', {'completed':[], 'planned':len(mapping)})
     return {'packet':str(packet), 'answers':len(mapping), 'private_mapping_sha256':sha(private_mapping),
@@ -165,7 +166,7 @@ def check_topic_seal(packet, expected_input_seal_sha256=None, private_mapping=No
     inputs = read(packet/'input-seal.json')
     source_validation = inputs.get('source_validation')
     if source_validation is not None:
-        require(source_validation.get('policy') == 'app-final-answer-v1'
+        require(source_validation.get('policy') in ('app-final-answer-v1', 'mixed-final-answer-v1')
                 and private_mapping is not None, 'App topic export requires coordinator private mapping')
         require(sha(private_mapping) == source_validation.get('mapping_sha256'),
                 'App topic private mapping differs from frozen source binding')

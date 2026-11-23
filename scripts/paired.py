@@ -248,6 +248,9 @@ def adopt_pilot(root,pilot):
 
 
 def status(root):
+    if load(root)[1].get("design")=="independent-reviewers":
+        import independent_review
+        return independent_review.status(root)
     root,p=load(root);states=[state(root,u) for u in p["units"]]
     grades=[read(f) for f in (root/"grades").glob("*/state.json")] if (root/"grades").exists() else []
     return {"batch_dir":str(root),"baselines":100,"planned_revisions":200,
@@ -261,6 +264,9 @@ def status(root):
 
 
 def dispatch(root):
+    if load(root)[1].get("design")=="independent-reviewers":
+        import independent_review
+        return independent_review.dispatch(root)
     root,p=load(root);states={u:state(root,u) for u in p["units"]}
     parallel=concurrency_policy(root)
     require(not any(s["status"] in {"launching","unknown-inflight"} for s in states.values()),
@@ -416,6 +422,7 @@ def dispatch(root):
 def register(root,unit,thread_id,host_id="local",grading=False):
     root,p=load(root);path=root/("grades" if grading else "units")/unit/"state.json"
     s=read(path);require(s["status"]=="launching","No matching durable launch intent")
+    require(s.get("backend", "app") == "app", "CLI jobs require native terminal receipts, not App registration")
     require(isinstance(thread_id,str) and re.fullmatch(r"[A-Za-z0-9-]+",thread_id),"Invalid App thread ID")
     require(not s.get("thread_id") or s["thread_id"]==thread_id,"Resume must retain the existing App chat")
     s.update(status="running",thread_id=thread_id,host_id=host_id,registered_at=now())
@@ -447,6 +454,9 @@ def execution_receipt(root,s):
 
 
 def collect(root,unit,message_json,completion_json):
+    if load(root)[1].get("design")=="independent-reviewers":
+        import independent_review
+        return independent_review.collect(root,unit,message_json,completion_json)
     root,p=load(root);s=state(root,unit)
     require(s["status"] in {"running","collecting","awaiting-audit"},"Cannot collect this paired unit")
     message,completion=read(message_json),read(completion_json)
@@ -618,6 +628,9 @@ def validate_peer(root,s,audit,allow_unassisted=False):
 
 
 def blind(root):
+    if load(root)[1].get("design")=="independent-reviewers":
+        import independent_review
+        return independent_review.blind(root)
     root,p=load(root)
     require(all(state(root,u)["status"] in COMPLETE for u in p["units"]),"Finish all paired answers before grading")
     groups=[]
@@ -687,6 +700,12 @@ def grade_complete(root,unit):
 
 
 def grade_packet(root,record):
+    if record.get("external_packet"):
+        require(load(root)[1].get("design")=="independent-reviewers", "External packet requires independent review design")
+        packet=Path(record["external_packet"]).resolve()
+        require(packet.parent==(home()/"benchmarks/blind-context").resolve()
+            and packet.name==record.get("anonymous_packet_id"), "Use a neutral opaque grading directory")
+        return packet
     return inside(root,record["packet"]) if record.get("packet") else Path(root)/"grades"/record["unit"]/"packet"
 
 
@@ -696,5 +715,9 @@ def verify(root):
         require(sha(inside(root,relative))==expected,"Frozen paired input changed: "+relative)
     for name,expected in frozen["preservation"].items():require(sha(name)==expected,"Historical source changed")
     for unit,expected in frozen["prompts"].items():require(sha(root/"units"/unit/"prompt.txt")==expected,"Review prompt changed")
+    if p.get("design")=="independent-reviewers":
+        for name, expected in frozen.get("runtime_inputs", {}).items():
+            require(sha(name)==expected, "Runtime review input changed: "+name)
+        require(sha(root/"private/input-views.json")==frozen["input_views_sha256"], "Input anonymization mapping changed")
     return {"valid":True,"frozen_files":len(frozen["inputs"]),"historical_files":len(frozen["preservation"]),"prompts":len(frozen["prompts"])}
 

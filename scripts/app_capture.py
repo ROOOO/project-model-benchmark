@@ -148,6 +148,15 @@ def validate_answer_entry(entry):
     require(isinstance(entry, dict), "Invalid answer entry")
     result = dict(entry)
     answer = Path(result["answer"]).resolve()
+    if result.get("answer_source") == "antigravity-terminal-v1" or result.get("cli_answer_receipt"):
+        from antigravity import validate_terminal_capture
+        path = result.get("cli_answer_receipt")
+        require(isinstance(path, str) and path and not result.get("answer_receipt"), "CLI answer needs its native receipt")
+        receipt = validate_terminal_capture(path, answer)
+        require(result.get("answer_sha256") == receipt["answer_sha256"], "CLI answer hash differs from receipt")
+        require(result.get("cli_answer_receipt_sha256", sha(path)) == sha(path), "CLI receipt changed")
+        result.update(answer_source=receipt["answer_source"], cli_answer_receipt_sha256=sha(path))
+        return result
     receipt_path = result.get("answer_receipt")
     adjacent = answer.parent / RECEIPT_FILE
     if not receipt_path and adjacent.is_file():

@@ -166,6 +166,9 @@ def historical_performance(pair):
 
 
 def export(directory):
+    if paired.load(directory)[1].get("design")=="independent-reviewers":
+        from independent_report import export as independent_export
+        return independent_export(directory)
     root,p=paired.load(directory);verification=paired.verify(root)
     require(paired.status(root)["completed_revisions"]==200,"Cannot export incomplete paired revisions")
     samples=[];grading=[];rubrics={}

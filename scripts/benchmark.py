@@ -56,11 +56,15 @@ def parser():
     paired_prepare.add_argument("--selection", required=True)
     paired_prepare.add_argument("--comparison", required=True)
     paired_prepare.add_argument("--batch-dir", required=True)
-    paired_prepare.add_argument("--pilot", required=True)
-    for command in ("paired-status", "paired-next", "paired-register", "paired-collect", "paired-blind", "paired-grade-next", "paired-grade-complete", "paired-verify", "paired-report"):
+    paired_prepare.add_argument("--pilot")
+    paired_prepare.add_argument("--design", choices=["matched-ab", "independent-reviewers"], default="matched-ab")
+    paired_prepare.add_argument("--source-model")
+    paired_prepare.add_argument("--reviewers", help="JSON configurations for two independent reviewers")
+    paired_prepare.add_argument("--previous-batch", help="Read-only prior paired report to retain alongside the new group")
+    for command in ("paired-status", "paired-next", "paired-register", "paired-collect", "paired-blind", "paired-grade-next", "paired-grade-complete", "paired-verify", "paired-report", "paired-run-cli", "paired-reconcile-cli", "paired-retry"):
         q = sub.add_parser(command)
         q.add_argument("--batch-dir", required=True)
-        if command in ("paired-register", "paired-collect", "paired-grade-complete"):
+        if command in ("paired-register", "paired-collect", "paired-grade-complete", "paired-run-cli", "paired-reconcile-cli", "paired-retry"):
             q.add_argument("--unit", required=True)
         if command == "paired-register":
             q.add_argument("--thread-id", required=True)
@@ -156,7 +160,12 @@ def main(argv=None):
         import paired
         command = args.command
         if command == "paired-prepare":
-            value = paired.prepare(args.selection, args.comparison, args.batch_dir, args.pilot)
+            if args.design == "independent-reviewers":
+                from independent_review import prepare as prepare_independent
+                value = prepare_independent(args.selection, args.comparison, args.batch_dir, args.source_model, args.reviewers, args.previous_batch)
+            else:
+                require(args.pilot, "The matched A/B design requires --pilot")
+                value = paired.prepare(args.selection, args.comparison, args.batch_dir, args.pilot)
         elif command == "paired-status":
             value = paired.status(args.batch_dir)
         elif command == "paired-next":
@@ -174,6 +183,12 @@ def main(argv=None):
         elif command == "paired-report":
             from paired_report import export
             value = export(args.batch_dir)
+        elif command in ("paired-run-cli", "paired-reconcile-cli", "paired-retry"):
+            import independent_review
+            action = {"paired-run-cli": independent_review.run_cli,
+                      "paired-reconcile-cli": independent_review.reconcile_cli,
+                      "paired-retry": independent_review.retry}[command]
+            value = action(args.batch_dir, args.unit)
         else:
             value = paired.verify(args.batch_dir)
     elif args.command.startswith("study-"):

@@ -14,7 +14,6 @@ import shutil
 import subprocess
 import threading
 import time
-
 from core import check_sensitive, digest, metrics, now, read, require, sha, write
 from runtime import process_identity
 
@@ -93,6 +92,7 @@ def normalized_path(path):
     # Matching normalizes drives internally, but native sandbox mounts still
     # need a complete Windows absolute path in the permission declaration.
     return Path(path).resolve().as_posix()
+
 
 
 def session_settings(profile, scratch):
@@ -194,7 +194,7 @@ def access_audit(events):
             "coverage": "CLI-exposed tool arguments only; unreported descendant reads are unknown"}
 
 
-def run_trial(root, protocol, slot, attempt, binary, fingerprint, scratch, *, prompt_override=None, capability=False):
+def run_trial(root, protocol, slot, attempt, binary, fingerprint, scratch, *, prompt_override=None, capability=False, new_project=False, delegation_guard=False):
     """Run exactly one fresh conversation. Never impose a generation timeout."""
     root, scratch = Path(root), Path(scratch)
     require(not scratch.exists(), "Every sample needs a new scratch workspace")
@@ -216,9 +216,14 @@ def run_trial(root, protocol, slot, attempt, binary, fingerprint, scratch, *, pr
             "--mode", "accept-edits", "--settings", str(directory / "session-settings.json"),
             "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands"]
     args.append("--dangerously-skip-permissions" if profile.get("mode") == FULL_MODE else "--sandbox")
+    if new_project:
+        args.append("--new-project")
     started = time.monotonic()
+    environment = None
+    if delegation_guard:
+        environment = {**os.environ, "CODEX_PEER_ACTIVE": "1", "PEER_ANALYSIS_ACTIVE": "1"}
     proc = subprocess.Popen(args, cwd=scratch, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
+                            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1, env=environment)
     inflight = {"pid": os.getpid(), "identity": process_identity(os.getpid()),
                 "server_pid": proc.pid, "server_identity": process_identity(proc.pid), "slot_id": slot["id"],
                 "attempt": attempt, "relative_dir": relative, "started_at": now(), "purpose": "capability" if capability else "formal"}
@@ -318,6 +323,10 @@ def run_trial(root, protocol, slot, attempt, binary, fingerprint, scratch, *, pr
               "cli_duration_seconds": native.get("duration_seconds"),
               "answer_ready_s": (terminal or {}).get("t_s"), "limitations": LIMITATIONS,
               "session_settings_sha256": sha(directory / "session-settings.json"),
+              "new_project": new_project,
+              "delegation_guard": {"CODEX_PEER_ACTIVE": "1", "PEER_ANALYSIS_ACTIVE": "1"} if delegation_guard else {},
+              "cli_invocation": {"model": slot["model"], "effort": slot["effort"], "new_project": new_project,
+                  "access_mode": "full-access" if profile.get("mode") == FULL_MODE else "restricted"},
               **cli_metrics(protocol, usage, elapsed, answer=answer)}
     if capability:
         record["purpose"] = "capability"
@@ -333,7 +342,7 @@ def validate_record(root, protocol, record, directory, answer):
     terminal = [e for e in events if e.get("event") == "result"]
     initial = [e for e in events if e.get("event") == "init"]
     require(record.get("runtime_backend") == BACKEND, "Missing CLI backend identity")
-    if record.get("valid"):
+    if record.get("valid") or record.get("transport_valid"):
         require(len(terminal) == len(initial) == 1, "CLI receipt missing or duplicated")
         native = terminal[0]["result"]
         require(native.get("status") == "SUCCESS" and native.get("num_turns") == 1 and record["cli_exit_code"] == 0,
@@ -342,6 +351,9 @@ def validate_record(root, protocol, record, directory, answer):
                 "CLI terminal answer/usage differs from archived receipt")
         require(initial[0]["init"].get("model") == record["model"] and not record.get("protocol_issues"),
                 "CLI model identity or protocol failed")
+        if "cli_invocation" in record:
+            require(record["cli_invocation"].get("model") == record["model"]
+                    and record["cli_invocation"].get("effort") == record["effort"], "CLI invocation model/effort differs")
         require(native.get("conversation_id") == record.get("thread_id"), "CLI conversation identity differs")
         if protocol.get("execution_profile", {}).get("mode") == FULL_MODE:
             require(initial[0]["init"].get("permission_mode") == "always-proceed", "Full Access receipt differs")
@@ -350,3 +362,57 @@ def validate_record(root, protocol, record, directory, answer):
         require(record.get("contaminated") == record["tool_access"]["grading_material_access_detected"], "Contamination flag differs")
         require(not record.get("valid") or not record.get("contaminated"), "Contaminated sample cannot be clean")
     return cli_metrics(protocol, record.get("usage"), record.get("elapsed_s"), answer=answer)
+
+
+CLI_ANSWER_POLICY = "antigravity-terminal-v1"
+CLI_RECEIPT = "cli-answer-receipt.json"
+
+
+def capture_terminal(root, directory):
+    """Bind a full native CLI final; no model call or App-receipt substitution."""
+    root, directory = Path(root).resolve(), Path(directory).resolve()
+    require(directory.parent.parent.parent == root, "CLI attempt must be inside its transport root")
+    record, protocol = read(directory / "result.json"), read(root / "protocol.json")
+    require(record.get("transport_valid") and (directory / "answer.txt").read_text(encoding="utf-8").strip(),
+            "CLI final needs a successful, nonempty native terminal")
+    # Do not normalize line endings when comparing the selected final.
+    answer = (directory / "answer.txt").read_bytes().decode("utf-8")
+    validate_record(root, protocol, record, directory, answer)
+    receipt = {"schema_version": 1, "answer_source": CLI_ANSWER_POLICY,
+        "captured_at": now(), "status": "captured", "model": record["model"], "effort": record["effort"],
+        "conversation_id": record["thread_id"], "answer_sha256": sha(directory / "answer.txt"),
+        "protocol_sha256": sha(root / "protocol.json"), "contaminated": record.get("contaminated", False),
+        "files_sha256": {name: sha(directory / name) for name in
+            ("answer.txt", "result.json", "events.jsonl", "session-settings.json")}, "new_model_calls": 0}
+    path = directory / CLI_RECEIPT
+    if path.exists():
+        existing = validate_terminal_capture(path)
+        require(all(existing[k] == v for k, v in receipt.items() if k != "captured_at"), "CLI capture conflicts with its native final")
+    else:
+        write(path, receipt)
+    return {"answer": str(directory / "answer.txt"), "answer_sha256": receipt["answer_sha256"],
+        "answer_source": CLI_ANSWER_POLICY, "cli_answer_receipt": str(path), "cli_answer_receipt_sha256": sha(path)}
+
+
+def validate_terminal_capture(receipt_path, answer_path=None):
+    path = Path(receipt_path).resolve(); directory = path.parent
+    root = directory.parent.parent.parent
+    receipt = read(path)
+    require(receipt.get("schema_version") == 1 and receipt.get("answer_source") == CLI_ANSWER_POLICY
+            and receipt.get("status") == "captured", "Unsupported CLI final capture")
+    require(set(receipt.get("files_sha256", {})) == {"answer.txt", "result.json", "events.jsonl", "session-settings.json"},
+            "CLI capture file set differs")
+    for name, expected in receipt["files_sha256"].items():
+        require(sha(directory / name) == expected, "CLI final source bytes changed: " + name)
+    require(sha(root / "protocol.json") == receipt["protocol_sha256"], "CLI capture protocol changed")
+    protocol, record = read(root / "protocol.json"), read(directory / "result.json")
+    answer = (directory / "answer.txt").read_bytes().decode("utf-8")
+    require(record.get("transport_valid") and answer.strip(), "CLI capture lacks successful native final")
+    validate_record(root, protocol, record, directory, answer)
+    require(receipt["model"] == record["model"] and receipt["effort"] == record["effort"]
+            and receipt["conversation_id"] == record["thread_id"]
+            and receipt["answer_sha256"] == sha(directory / "answer.txt")
+            and receipt["contaminated"] == record.get("contaminated", False), "CLI capture identity differs")
+    if answer_path is not None:
+        require(Path(answer_path).read_bytes() == answer.encode("utf-8"), "Selected answer differs from CLI terminal")
+    return receipt
