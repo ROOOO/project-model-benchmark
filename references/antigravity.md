@@ -37,7 +37,7 @@ Full Access 下仍明确要求模型只分析冻结材料、不读取历史答�
 
 完整原生事件已证明成功，仅本地解析失败时，可创建同题、同源码、同权限的新批次，使用 `study-recover-smoke --study-dir <新批次> --source <原批次>` 离线复核。只允许 runner 代码指纹变化，校验原有效终态、实际命令输出、源码哈希和 Full Access 回执；保留原失败，复制原回执但不改原模型身份／消耗，历史付费调用单列，新调用为0。不能从模型宣称或残余文字补造工具证据。
 
-每份正式答案使用独立 CLI 进程和新会话，通过 stdin 提交题面，以 `stream-json` 收集允许字段。只以终态 `result.response` 提取答案；不拼接中间回复，不保存私有推理或原始 stderr。模型身份不符、非成功终态、空答案、多终态回执等均不是有效样本。
+每份正式答案使用独立 CLI 进程和新会话，通过 stdin 提交题面，以 `stream-json` 收集允许字段。只以终态 `result.response` 提取答案；不拼接中间回复，不保存私有推理或原始 stderr。模型身份不符、非成功终态、空答案、多终态回执等均不是有效样本。并发隔离启用 `--new-project` 时，脚本在确认终态后按本轮唯一 `scratch` 路径精确回收新建的临时 `~/.gemini/config/projects/<uuid>.json`（不触碰既有用例、默认项目、sidecar 或代码仓项目）；也可按需传 `project` 复用固定项目。异常中断遗留的已完成临时项目可通过 `benchmark.py cleanup-agy-projects`（默认 dry-run，加 `--apply` 与可选 `--archive-dir` 执行）回收。
 
 成功样本不重跑。额度或限流明确失败后停止追加请求、保留全部尝试和下一位置；`study-resume` 不自动重试失败，用户授权后才加 `--retry-failed`。缺少终态时保留 inflight，先检查实际进程和持久证据，不能从本地进程退出推断远端已停。不设置整体生成截止时间。
 

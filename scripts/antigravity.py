@@ -14,7 +14,9 @@ import shutil
 import subprocess
 import threading
 import time
-from core import check_sensitive, digest, metrics, now, read, require, sha, write
+import urllib.parse
+
+from core import check_sensitive, digest, home, metrics, now, read, require, sha, write
 from runtime import process_identity
 
 
@@ -93,6 +95,278 @@ def normalized_path(path):
     # need a complete Windows absolute path in the permission declaration.
     return Path(path).resolve().as_posix()
 
+
+def projects_config_dir():
+    return Path.home() / ".gemini/config/projects"
+
+
+def _canonical_path(path):
+    return os.path.normcase(os.path.normpath(str(Path(path).resolve(strict=False))))
+
+
+def _is_under(child, parent):
+    c, p = _canonical_path(child), _canonical_path(parent)
+    prefix = p if p.endswith(os.sep) else p + os.sep
+    return c != p and c.startswith(prefix)
+
+
+def folder_uri_to_path(uri):
+    """Resolve local file:// URIs (both file://C:/... and file:///c%3A/...) safely."""
+    if not isinstance(uri, str) or not uri.lower().startswith("file:"):
+        return None
+    parsed = urllib.parse.urlparse(uri)
+    if parsed.scheme.lower() != "file":
+        return None
+    netloc = urllib.parse.unquote(parsed.netloc or "")
+    path = urllib.parse.unquote(parsed.path or "")
+    if re.fullmatch(r"[A-Za-z]:", netloc):
+        raw = netloc + path
+    elif netloc in ("", "localhost"):
+        raw = path[1:] if re.match(r"^/[A-Za-z]:(?:[\\/]|$)", path) else path
+    else:
+        return None
+    if not raw:
+        return None
+    return Path(raw).resolve(strict=False)
+
+
+def ephemeral_project_target(path):
+    """Return metadata only for non-default, non-sidecar, single local-folder CLI projects."""
+    path = Path(path)
+    if path.name.lower() == "default-cli-project.json":
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    project_id = data.get("id")
+    if not isinstance(project_id, str) or not project_id.strip() or project_id == "default-cli-project":
+        return None
+    if "sidecar" in data:
+        return None
+    resources = (data.get("projectResources") or {}).get("resources")
+    if not isinstance(resources, list) or len(resources) != 1:
+        return None
+    entry = resources[0]
+    if not isinstance(entry, dict) or "gitFolder" in entry:
+        return None
+    folder = folder_uri_to_path(entry.get("folderUri"))
+    if folder is None:
+        return None
+    return {"id": project_id, "name": data.get("name"), "folder": folder, "path": path}
+
+
+def snapshot_projects_dir():
+    directory = projects_config_dir()
+    if not directory.is_dir():
+        return set()
+    try:
+        return {_canonical_path(p) for p in directory.glob("*.json")}
+    except OSError:
+        return set()
+
+
+def _remove_project_file(path, archive_dir=None):
+    path = Path(path)
+    if archive_dir is not None:
+        archive_dir = Path(archive_dir).resolve(strict=False)
+        config_dir = projects_config_dir().resolve(strict=False)
+        require(_canonical_path(archive_dir) != _canonical_path(config_dir) and not _is_under(archive_dir, config_dir),
+                "Archive directory must be outside Antigravity projects config directory")
+        try:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            dest = archive_dir / path.name
+            if not dest.exists():
+                shutil.copy2(path, dest)
+        except OSError as exc:
+            return f"{type(exc).__name__}: {exc}"
+    last_error = None
+    for delay in (0.0, 0.1, 0.2):
+        if delay:
+            time.sleep(delay)
+        try:
+            path.unlink()
+            return None
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            last_error = exc
+    return f"{type(last_error).__name__}: {last_error}"
+
+
+def cleanup_ephemeral_projects_for_dir(target_dir, *, pre_existing=None, archive_dir=None):
+    """Remove only ephemeral CLI project JSON files matching target_dir exactly."""
+    directory = projects_config_dir()
+    if not directory.is_dir():
+        return {"removed": [], "errors": []}
+    expected = _canonical_path(target_dir)
+    pre = set(pre_existing) if pre_existing is not None else None
+    removed, errors = [], []
+    try:
+        candidates = sorted(directory.glob("*.json"))
+    except OSError as exc:
+        return {"removed": [], "errors": [f"{type(exc).__name__}: {exc}"]}
+    for path in candidates:
+        if pre is not None and _canonical_path(path) in pre:
+            continue
+        info = ephemeral_project_target(path)
+        if info is None or _canonical_path(info["folder"]) != expected:
+            continue
+        err = _remove_project_file(path, archive_dir=archive_dir)
+        if err:
+            errors.append({"id": info["id"], "file": path.name, "error": err})
+        else:
+            removed.append({"id": info["id"], "name": info["name"], "file": path.name})
+    return {"removed": removed, "errors": errors}
+
+
+def _active_benchmark_targets(benchmark_root):
+    active_scratches, active_work_roots, active_peer_runs, active_peer_roots = set(), set(), set(), set()
+    unscoped_inflight = False
+    if not benchmark_root.is_dir():
+        return active_scratches, active_work_roots, active_peer_runs, active_peer_roots, unscoped_inflight
+    for inflight in benchmark_root.rglob("inflight.json"):
+        scoped = False
+        for candidate in (inflight.parent / "protocol.json", inflight.parent.parent / "study.json",
+                          inflight.parent.parent.parent.parent / "protocol.json"):
+            if not candidate.is_file():
+                continue
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            profile = data.get("execution_profile") if isinstance(data, dict) else None
+            for root_value in (
+                data.get("work_root") if isinstance(data, dict) else None,
+                profile.get("model_work_root") if isinstance(profile, dict) else None,
+                profile.get("scratch_root") if isinstance(profile, dict) else None,
+            ):
+                if isinstance(root_value, str) and root_value.strip():
+                    active_work_roots.add(_canonical_path(root_value))
+                    scoped = True
+        if not scoped:
+            unscoped_inflight = True
+    for state_file in benchmark_root.glob("*/units/*/state.json"):
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            unscoped_inflight = True
+            continue
+        if isinstance(state, dict) and state.get("status") in {"launching", "running", "collecting", "awaiting-audit", "unknown-inflight"}:
+            if isinstance(state.get("scratch"), str) and state["scratch"].strip():
+                active_scratches.add(_canonical_path(state["scratch"]))
+            else:
+                proto_file = state_file.parents[2] / "protocol.json"
+                if proto_file.is_file():
+                    try:
+                        proto = json.loads(proto_file.read_text(encoding="utf-8-sig"))
+                        if isinstance(proto.get("work_root"), str) and proto["work_root"].strip():
+                            active_work_roots.add(_canonical_path(proto["work_root"]))
+                        else:
+                            unscoped_inflight = True
+                    except (OSError, ValueError):
+                        unscoped_inflight = True
+                else:
+                    unscoped_inflight = True
+    for active_file in benchmark_root.glob("*/units/*/peer-state/active.json"):
+        try:
+            active = json.loads(active_file.read_text(encoding="utf-8-sig"))
+            run_id = active.get("run_id") if isinstance(active, dict) else None
+            if isinstance(run_id, str) and run_id.strip():
+                active_peer_runs.add(_canonical_path(active_file.parent / "runs" / run_id))
+            else:
+                active_peer_roots.add(_canonical_path(active_file.parent))
+        except (OSError, ValueError):
+            active_peer_roots.add(_canonical_path(active_file.parent))
+    return active_scratches, active_work_roots, active_peer_runs, active_peer_roots, unscoped_inflight
+
+
+def cleanup_stale_projects(*, benchmark_root=None, work_root=None, dry_run=True, archive_dir=None):
+    """Inspect or clean leftover ephemeral Antigravity projects from completed benchmark runs."""
+    directory = projects_config_dir()
+    bench = Path(benchmark_root).resolve(strict=False) if benchmark_root else (home() / "benchmarks").resolve(strict=False)
+    work = Path(work_root).resolve(strict=False) if work_root else (
+        Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "agy-benchmark-work"
+    ).resolve(strict=False)
+    if archive_dir is not None:
+        archive_dir = Path(archive_dir).resolve(strict=False)
+        config_dir = directory.resolve(strict=False)
+        require(_canonical_path(archive_dir) != _canonical_path(config_dir) and not _is_under(archive_dir, config_dir),
+                "Archive directory must be outside Antigravity projects config directory")
+    active_scratches, active_work_roots, active_peer_runs, active_peer_roots, unscoped_inflight = _active_benchmark_targets(bench)
+    candidates, removed, skipped_active, skipped_unverified, errors = [], [], [], [], []
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.json")):
+            info = ephemeral_project_target(path)
+            if info is None:
+                continue
+            folder = info["folder"]
+            kind = None
+            run_dir = None
+            if _is_under(folder, work):
+                rel = Path(_canonical_path(folder)).relative_to(_canonical_path(work))
+                if len(rel.parts) == 3 and rel.parts[1].lower() == "scratch":
+                    if (unscoped_inflight or _canonical_path(folder) in active_scratches
+                            or any(_is_under(folder, Path(aw)) or _canonical_path(folder) == aw for aw in active_work_roots)):
+                        skipped_active.append({"id": info["id"], "name": info["name"], "file": path.name, "folder": str(folder), "reason": "active-or-inflight-benchmark"})
+                        continue
+                    kind = "benchmark-scratch"
+            elif _is_under(folder, bench):
+                rel = Path(_canonical_path(folder)).relative_to(_canonical_path(bench))
+                if (len(rel.parts) == 7 and rel.parts[1].lower() == "units"
+                        and rel.parts[3].lower() == "peer-state" and rel.parts[4].lower() == "runs"
+                        and rel.parts[6].lower() == "input"):
+                    run_dir = folder.parent
+                    peer_state = run_dir.parent.parent
+                    if _canonical_path(run_dir) in active_peer_runs or _canonical_path(peer_state) in active_peer_roots:
+                        skipped_active.append({"id": info["id"], "name": info["name"], "file": path.name, "folder": str(folder), "reason": "active-peer-run"})
+                        continue
+                    run_file = run_dir / "run.json"
+                    try:
+                        record = json.loads(run_file.read_text(encoding="utf-8-sig"))
+                    except (OSError, ValueError):
+                        skipped_unverified.append({"id": info["id"], "name": info["name"], "file": path.name, "folder": str(folder), "reason": "missing-or-unreadable-run-record"})
+                        continue
+                    terminal_ok = isinstance(record, dict) and (
+                        record.get("terminal_verified") is True
+                        or record.get("status") in {"resolved-stopped", "failed-before-launch"}
+                    )
+                    if not terminal_ok:
+                        skipped_unverified.append({"id": info["id"], "name": info["name"], "file": path.name, "folder": str(folder), "reason": "unverified-peer-run"})
+                        continue
+                    kind = "benchmark-peer-input"
+            if kind is None:
+                continue
+            item = {"id": info["id"], "name": info["name"], "file": path.name, "kind": kind, "folder": str(folder)}
+            candidates.append(item)
+            if not dry_run:
+                if kind == "benchmark-peer-input" and run_dir is not None and run_dir.is_dir():
+                    archived = run_dir / "ephemeral-project.json"
+                    if not archived.exists():
+                        try:
+                            shutil.copy2(path, archived)
+                        except OSError as exc:
+                            errors.append({**item, "error": f"{type(exc).__name__}: {exc}"})
+                            continue
+                err = _remove_project_file(path, archive_dir=archive_dir)
+                if err:
+                    errors.append({**item, "error": err})
+                else:
+                    removed.append(item)
+    return {
+        "projects_dir": str(directory),
+        "dry_run": dry_run,
+        "archive_dir": str(archive_dir) if archive_dir is not None else None,
+        "matched": len(candidates),
+        "removed_count": len(removed),
+        "candidates": candidates,
+        "removed": removed,
+        "skipped_active": skipped_active,
+        "skipped_unverified": skipped_unverified,
+        "errors": errors,
+    }
 
 
 def session_settings(profile, scratch):
@@ -194,9 +468,13 @@ def access_audit(events):
             "coverage": "CLI-exposed tool arguments only; unreported descendant reads are unknown"}
 
 
-def run_trial(root, protocol, slot, attempt, binary, fingerprint, scratch, *, prompt_override=None, capability=False, new_project=False, delegation_guard=False):
+def run_trial(root, protocol, slot, attempt, binary, fingerprint, scratch, *, prompt_override=None, capability=False, new_project=False, project=None, delegation_guard=False, cleanup_new_project=True):
     """Run exactly one fresh conversation. Never impose a generation timeout."""
     root, scratch = Path(root), Path(scratch)
+    require(not (new_project and project), "Cannot combine new_project and explicit project")
+    if project is not None:
+        require(isinstance(project, str) and bool(project.strip()), "Explicit project must be a non-empty string")
+        project = project.strip()
     require(not scratch.exists(), "Every sample needs a new scratch workspace")
     scratch.mkdir(parents=True)
     relative = ("capability/" if capability else "") + f"runs/{slot['id']}/attempt-{attempt:03d}"
@@ -216,8 +494,11 @@ def run_trial(root, protocol, slot, attempt, binary, fingerprint, scratch, *, pr
             "--mode", "accept-edits", "--settings", str(directory / "session-settings.json"),
             "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands"]
     args.append("--dangerously-skip-permissions" if profile.get("mode") == FULL_MODE else "--sandbox")
+    before_projects = snapshot_projects_dir() if (new_project and cleanup_new_project) else None
     if new_project:
         args.append("--new-project")
+    elif project:
+        args += ["--project", project]
     started = time.monotonic()
     environment = None
     if delegation_guard:
@@ -285,6 +566,9 @@ def run_trial(root, protocol, slot, attempt, binary, fingerprint, scratch, *, pr
     for reader in readers:
         reader.join()
     elapsed = time.monotonic() - started
+    project_cleanup = None
+    if new_project and cleanup_new_project and terminal is not None:
+        project_cleanup = cleanup_ephemeral_projects_for_dir(scratch, pre_existing=before_projects)
     native = (terminal or {}).get("result", {})
     answer = native.get("response", "")
     answer = answer if isinstance(answer, str) else ""
@@ -326,7 +610,10 @@ def run_trial(root, protocol, slot, attempt, binary, fingerprint, scratch, *, pr
               "new_project": new_project,
               "delegation_guard": {"CODEX_PEER_ACTIVE": "1", "PEER_ANALYSIS_ACTIVE": "1"} if delegation_guard else {},
               "cli_invocation": {"model": slot["model"], "effort": slot["effort"], "new_project": new_project,
+                  **({"project": project} if project else {}),
                   "access_mode": "full-access" if profile.get("mode") == FULL_MODE else "restricted"},
+              **({"project": project} if project else {}),
+              **({"ephemeral_project_cleanup": project_cleanup} if project_cleanup is not None else {}),
               **cli_metrics(protocol, usage, elapsed, answer=answer)}
     if capability:
         record["purpose"] = "capability"

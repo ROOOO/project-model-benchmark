@@ -311,5 +311,157 @@ class CliExportTests(unittest.TestCase):
                 validate_records(batch)
 
 
+class EphemeralProjectCleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.projects = self.base / "agy-projects"
+        self.projects.mkdir()
+        self.root = self.base / "batch"
+        (self.root / "input").mkdir(parents=True)
+        (self.root / "input/prompt.txt").write_text("题目", encoding="utf-8")
+        write(self.root / "input/instructions.json", {"base": None, "developer": "Read sources only."})
+        self.profile = {"mode": agy.FULL_MODE}
+        self.protocol = {"runtime_backend": "antigravity", "execution_profile": self.profile}
+        self.slot = {"id": "0001", "model": "gemini-4-neon-xhigh", "effort": "xhigh", "repetition": 1}
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write_project(self, filename, payload):
+        path = self.projects / filename
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def test_folder_uri_parsing_handles_windows_and_rejects_unc(self):
+        target = self.base / "scratch/r4-t1-m1-b-001"
+        posix = target.resolve().as_posix()
+        if os.name == "nt":
+            drive, rest = posix[:2], posix[2:]
+            two_slash = f"file://{drive}{rest}"
+            three_slash_encoded = f"file:///{drive[0].lower()}%3A{rest}"
+            self.assertEqual(agy._canonical_path(agy.folder_uri_to_path(two_slash)), agy._canonical_path(target))
+            self.assertEqual(agy._canonical_path(agy.folder_uri_to_path(three_slash_encoded)), agy._canonical_path(target))
+        else:
+            self.assertEqual(agy._canonical_path(agy.folder_uri_to_path("file://" + posix)), agy._canonical_path(target))
+        self.assertIsNone(agy.folder_uri_to_path("file://remote-host/share/dir"))
+        self.assertIsNone(agy.folder_uri_to_path("https://example.com/dir"))
+
+    def test_new_project_cleans_only_matching_scratch_and_protects_other_projects(self):
+        scratch = self.base / "scratch/r1-t1-m1-b-001"
+        sibling = self.base / "scratch/r1-t2-m1-b-001"
+        default_proj = self.write_project("default-cli-project.json", {"id": "default-cli-project", "name": "CLI Project", "projectResources": {}})
+        sidecar_proj = self.write_project("sidecar.json", {"id": "sidecar", "name": "swarm/swarm_board", "sidecar": {"sidecarId": "swarm/swarm_board"}, "projectResources": {"resources": [{"folderUri": "file://" + scratch.resolve().as_posix()}]}})
+        git_proj = self.write_project("repo.json", {"id": "repo", "name": "repo", "projectResources": {"resources": [{"gitFolder": {"folderUri": "file://" + scratch.resolve().as_posix()}}]}})
+        preexisting = self.write_project("preexisting.json", {"id": "preexisting", "name": "pre", "projectResources": {"resources": [{"folderUri": "file://" + scratch.resolve().as_posix()}]}})
+        sibling_proj = self.write_project("sibling.json", {"id": "sibling", "name": "r1-t2-m1-b-001", "projectResources": {"resources": [{"folderUri": "file://" + sibling.resolve().as_posix()}]}})
+        created = []
+
+        def fake_popen(args, **kwargs):
+            cwd = Path(kwargs["cwd"]).resolve()
+            created.append(self.write_project("new-trial-uuid.json", {
+                "id": "new-trial-uuid", "name": cwd.name,
+                "projectResources": {"resources": [{"folderUri": "file://" + cwd.as_posix()}]},
+            }))
+            return FakeProcess(native_events(permission_mode="always-proceed"))
+
+        with patch.object(agy, "projects_config_dir", return_value=self.projects), \
+             patch.object(agy.subprocess, "Popen", side_effect=fake_popen):
+            record = agy.run_trial(self.root, self.protocol, self.slot, 1, Path(sys.executable), {}, scratch,
+                                   prompt_override="q", new_project=True)
+        self.assertTrue(record["valid"])
+        self.assertFalse(created[0].exists())
+        self.assertEqual([item["id"] for item in record["ephemeral_project_cleanup"]["removed"]], ["new-trial-uuid"])
+        for protected in (default_proj, sidecar_proj, git_proj, preexisting, sibling_proj):
+            self.assertTrue(protected.exists(), f"{protected.name} must not be deleted")
+
+    def test_interrupted_trial_preserves_ephemeral_project(self):
+        scratch = self.base / "scratch/r1-t3-m1-b-001"
+        created = []
+
+        def fake_popen(args, **kwargs):
+            cwd = Path(kwargs["cwd"]).resolve()
+            created.append(self.write_project("inflight-uuid.json", {
+                "id": "inflight-uuid", "name": cwd.name,
+                "projectResources": {"resources": [{"folderUri": "file://" + cwd.as_posix()}]},
+            }))
+            return FakeProcess(native_events(permission_mode="always-proceed")[:-1], code=1)
+
+        with patch.object(agy, "projects_config_dir", return_value=self.projects), \
+             patch.object(agy.subprocess, "Popen", side_effect=fake_popen):
+            record = agy.run_trial(self.root, self.protocol, self.slot, 1, Path(sys.executable), {}, scratch,
+                                   prompt_override="q", new_project=True)
+        self.assertEqual(record["status"], "interrupted")
+        self.assertTrue(created[0].exists())
+        self.assertNotIn("ephemeral_project_cleanup", record)
+
+    def test_explicit_project_passes_flag_is_exclusive_and_never_deleted(self):
+        scratch = self.base / "scratch/explicit-slot"
+        fixed = self.write_project("slot-1.json", {
+            "id": "slot-1", "name": "slot-1",
+            "projectResources": {"resources": [{"folderUri": "file://" + scratch.resolve().as_posix()}]},
+        })
+        with self.assertRaises(BenchmarkError):
+            agy.run_trial(self.root, self.protocol, self.slot, 1, Path(sys.executable), {}, scratch,
+                          prompt_override="q", new_project=True, project="slot-1")
+        with patch.object(agy, "projects_config_dir", return_value=self.projects), \
+             patch.object(agy.subprocess, "Popen", return_value=FakeProcess(native_events(permission_mode="always-proceed"))) as spawn:
+            record = agy.run_trial(self.root, self.protocol, self.slot, 1, Path(sys.executable), {}, scratch,
+                                   prompt_override="q", project="slot-1")
+        args = spawn.call_args.args[0]
+        self.assertIn("--project", args)
+        self.assertEqual(args[args.index("--project") + 1], "slot-1")
+        self.assertNotIn("--new-project", args)
+        self.assertEqual(record["project"], "slot-1")
+        self.assertTrue(fixed.exists())
+
+    def test_cleanup_stale_projects_respects_active_and_unverified_and_archives(self):
+        work = self.base / "agy-benchmark-work"
+        bench = self.base / "benchmarks"
+        done_scratch = work / "batchA/scratch/r1-t1-m1-b-001"
+        active_scratch = work / "batchA/scratch/r1-t2-m1-b-001"
+        peer_done_input = bench / "paired1/units/u1/peer-state/runs/run-done/input"
+        peer_active_input = bench / "paired1/units/u2/peer-state/runs/run-act/input"
+        peer_unverified_input = bench / "paired1/units/u3/peer-state/runs/run-unv/input"
+        for d in (done_scratch, active_scratch, peer_done_input, peer_active_input, peer_unverified_input):
+            d.mkdir(parents=True)
+        write(bench / "indep1/units/r1-t2-m1-b/state.json", {"status": "running", "scratch": str(active_scratch)})
+        write(peer_done_input.parent / "run.json", {"status": "completed", "terminal_verified": True})
+        write(peer_active_input.parent / "run.json", {"status": "running", "terminal_verified": False})
+        write(bench / "paired1/units/u2/peer-state/active.json", {"run_id": "run-act"})
+        write(peer_unverified_input.parent / "run.json", {"status": "unknown-inflight", "terminal_verified": False})
+
+        p_done = self.write_project("p-done.json", {"id": "p-done", "name": "r1-t1-m1-b-001", "projectResources": {"resources": [{"folderUri": "file://" + done_scratch.resolve().as_posix()}]}})
+        p_act = self.write_project("p-act.json", {"id": "p-act", "name": "r1-t2-m1-b-001", "projectResources": {"resources": [{"folderUri": "file://" + active_scratch.resolve().as_posix()}]}})
+        p_peer_done = self.write_project("p-peer-done.json", {"id": "p-peer-done", "name": "input", "projectResources": {"resources": [{"folderUri": "file://" + peer_done_input.resolve().as_posix()}]}})
+        p_peer_act = self.write_project("p-peer-act.json", {"id": "p-peer-act", "name": "input", "projectResources": {"resources": [{"folderUri": "file://" + peer_active_input.resolve().as_posix()}]}})
+        p_peer_unv = self.write_project("p-peer-unv.json", {"id": "p-peer-unv", "name": "input", "projectResources": {"resources": [{"folderUri": "file://" + peer_unverified_input.resolve().as_posix()}]}})
+        p_user = self.write_project("user.json", {"id": "user", "name": ".codex", "projectResources": {"resources": [{"folderUri": "file://" + (self.base / "user-dir").resolve().as_posix()}]}})
+
+        with patch.object(agy, "projects_config_dir", return_value=self.projects):
+            with self.assertRaises(BenchmarkError):
+                agy.cleanup_stale_projects(benchmark_root=bench, work_root=work, dry_run=False, archive_dir=self.projects / "sub")
+            preview = agy.cleanup_stale_projects(benchmark_root=bench, work_root=work, dry_run=True)
+            self.assertEqual({c["id"] for c in preview["candidates"]}, {"p-done", "p-peer-done"})
+            self.assertEqual({s["id"] for s in preview["skipped_active"]}, {"p-act", "p-peer-act"})
+            self.assertEqual({s["id"] for s in preview["skipped_unverified"]}, {"p-peer-unv"})
+            self.assertTrue(p_done.exists() and p_peer_done.exists())
+
+            archive_dir = self.base / "archive-backup"
+            applied = agy.cleanup_stale_projects(benchmark_root=bench, work_root=work, dry_run=False, archive_dir=archive_dir)
+            self.assertEqual(applied["removed_count"], 2)
+            self.assertFalse(p_done.exists())
+            self.assertFalse(p_peer_done.exists())
+            self.assertTrue((archive_dir / "p-done.json").is_file())
+            self.assertTrue((archive_dir / "p-peer-done.json").is_file())
+            self.assertTrue((peer_done_input.parent / "ephemeral-project.json").is_file())
+            for kept in (p_act, p_peer_act, p_peer_unv, p_user):
+                self.assertTrue(kept.exists())
+
+        parsed = parser().parse_args(["cleanup-agy-projects", "--apply", "--archive-dir", str(self.base / "bak")])
+        self.assertEqual(parsed.command, "cleanup-agy-projects")
+        self.assertTrue(parsed.apply)
+
+
 if __name__ == "__main__":
     unittest.main()

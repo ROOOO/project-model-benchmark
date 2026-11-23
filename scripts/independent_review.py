@@ -382,6 +382,8 @@ def reconcile_cli(directory, unit):
         state.update(status="invalidated" if interference["affected"] else "completed", completed_at=now(), capture=capture, native_result=str(attempt / "result.json"),
             independence_audit=str(attempt / "independence-audit.json"),
             contaminated=record.get("contaminated", False), audit=str(target) if audit.is_file() else None)
+    if terminal and record.get("new_project") and state.get("scratch"):
+        agy.cleanup_ephemeral_projects_for_dir(Path(state["scratch"]))
     paired.save_state(root, unit, state)
     return {"unit": unit, "status": state["status"], "contaminated": state.get("contaminated")}
 

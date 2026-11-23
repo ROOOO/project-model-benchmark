@@ -104,6 +104,11 @@ def parser():
     recovery = sub.add_parser("recover-smoke", help="Replay an archived capability check into a fresh revision; no inference")
     recovery.add_argument("--run-dir", required=True)
     recovery.add_argument("--source", required=True)
+    cleanup_agy = sub.add_parser("cleanup-agy-projects", help="Inspect or remove stale ephemeral Antigravity projects from completed benchmark runs; never starts inference")
+    cleanup_agy.add_argument("--apply", action="store_true", help="Remove matched ephemeral project JSON files (default is dry-run)")
+    cleanup_agy.add_argument("--archive-dir", help="Optional backup directory outside ~/.gemini/config/projects")
+    cleanup_agy.add_argument("--benchmark-root", help="Override benchmarks directory (defaults to ~/.codex/benchmarks)")
+    cleanup_agy.add_argument("--work-root", help="Override agy-benchmark-work directory (defaults to LOCALAPPDATA/agy-benchmark-work)")
     study_prepare = sub.add_parser("study-prepare", help="Prepare an Antigravity multi-topic cycle study; no inference")
     study_prepare.add_argument("--source-runs", nargs="+", required=True, help="Sealed historical batches, in topic order")
     study_prepare.add_argument("--study-dir", required=True)
@@ -244,6 +249,14 @@ def main(argv=None):
     elif args.command == "recover-smoke":
         from agentic_runtime import recover_capability
         value = recover_capability(args.run_dir, args.source)
+    elif args.command == "cleanup-agy-projects":
+        import antigravity as agy
+        value = agy.cleanup_stale_projects(
+            benchmark_root=args.benchmark_root,
+            work_root=args.work_root,
+            dry_run=not args.apply,
+            archive_dir=args.archive_dir,
+        )
     elif args.command in ["prepare", "retest"]:
         if args.command == "prepare":
             require(args.execution_mode != "project-readonly" or args.execution_spec, "Project-readonly preparation requires --execution-spec with source_roots")

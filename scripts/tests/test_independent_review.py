@@ -182,6 +182,30 @@ class IndependentReviewTests(unittest.TestCase):
         self.assertEqual(core.read(packet / "input-seal.json")["source_validation"]["policy"], "mixed-final-answer-v1")
         self.assertNotIn("antigravity", (packet / "answers/A001.txt").read_text(encoding="utf-8"))
 
+    def test_reconcile_cli_cleans_leftover_ephemeral_project_on_verified_terminal(self):
+        units = self.make_dispatch()
+        unit = next(u for u in units if u.endswith("-b"))
+        transport, attempt, _ = self.native_capture("revised answer")
+        scratch = self.root / "scratch"
+        state = paired.state(self.root, unit)
+        state.update(status="running", pid=999999999, process_identity="dead",
+                     transport_root=str(transport), scratch=str(scratch))
+        paired.save_state(self.root, unit, state)
+        projects = self.root / "agy-projects"
+        projects.mkdir()
+        leftover = projects / "leftover-uuid.json"
+        core.write(leftover, {"id": "leftover-uuid", "name": scratch.name,
+                              "projectResources": {"resources": [{"folderUri": "file://" + scratch.resolve().as_posix()}]}})
+        unrelated = projects / "other-uuid.json"
+        core.write(unrelated, {"id": "other-uuid", "name": "other",
+                               "projectResources": {"resources": [{"folderUri": "file://" + (self.root / "other").resolve().as_posix()}]}})
+        with patch.object(agy, "projects_config_dir", return_value=projects), \
+             patch.object(review, "still_running", return_value=False):
+            result = review.reconcile_cli(self.root, unit)
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(leftover.exists())
+        self.assertTrue(unrelated.exists())
+
 
 from collections import Counter
 
