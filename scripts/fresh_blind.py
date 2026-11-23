@@ -7,13 +7,15 @@ import shutil
 
 import core
 from core import inside, now, read, require, sha, three_dimension_scoring, validate_gold, validate_scores, write
+from app_capture import validate_answer_entry
 
 
 REVIEW_PROTOCOL = 'fresh-topic-blind'
 PRIVATE_KEYS = {'revision_label', 'revision_note', 'source_gold_sha256', 'normalization', 'reweight', 'review_revision'}
 PATH_PREFIX = re.compile(
     r'(?:file:///)?/?[A-Za-z]:[/\\][^\n`<>\]\)]*?'
-    r'(?:(?:[/\\](?:readonly[/\\])?source[/\\])(?=engineering[/\\])'
+    r'(?:(?:[/\\](?:readonly[/\\])?source(?:-snapshot)?[/\\])(?=engineering[/\\])'
+    r'|[/\\]readonly[/\\](?=(?:[^/\\\n`<>\]\)]+[/\\])?(?:prompt|question)\.txt(?=[:#\s`<>\]\)]|$))'
     r'|[/\\]scratch[/\\](?:[a-z-]+-\d+-\d+[/\\])?)', re.I)
 
 
@@ -22,7 +24,8 @@ def anonymous_view(text):
     edits, chunks, end, size = [], [], 0, 0
     for match in PATH_PREFIX.finditer(text):
         prefix = text[match.start():match.end()]
-        replacement = 'frozen/' if re.search(r'[/\\]source[/\\]$', prefix, re.I) else 'verification/'
+        replacement = ('frozen/' if re.search(r'[/\\]source(?:-snapshot)?[/\\]$', prefix, re.I)
+                       else 'materials/' if re.search(r'[/\\]readonly[/\\]$', prefix, re.I) else 'verification/')
         before = text[end:match.start()]
         chunks.extend((before, replacement))
         size += len(before)
@@ -94,6 +97,7 @@ def prepare_topic(entries, gold_path, packet, private_mapping):
     require(not private_mapping.is_relative_to(packet), 'Private mapping must stay outside the packet')
     gold = clean_gold(read(gold_path))
     require(entries and len({r['identity'] for r in entries}) == len(entries), 'Duplicate topic answers')
+    entries = [validate_answer_entry(entry) for entry in entries]
     question = Path(entries[0]['source'])/'input/question.txt'
     prompt = Path(entries[0]['source'])/'input/prompt.txt'
     packet.mkdir(parents=True)
@@ -141,13 +145,17 @@ def prepare_topic(entries, gold_path, packet, private_mapping):
         '每完成一份写reviews/<匿名编号>.json，结构见scores-template.json；运行python -X utf8 review_io.py check <编号>。'
         '全部完成后运行python -X utf8 review_io.py seal封存，封存后不再修改。中断后读取progress.json续做，不能重置完成项。\n', encoding='utf-8')
     files = {p.relative_to(packet).as_posix():sha(p) for p in packet.rglob('*') if p.is_file()}
-    write(packet/'input-seal.json', {'at':now(), 'review_protocol':REVIEW_PROTOCOL, 'answers':len(mapping), 'files_sha256':files})
+    input_seal = {'at':now(), 'review_protocol':REVIEW_PROTOCOL, 'answers':len(mapping), 'files_sha256':files}
+    if any(entry.get('answer_receipt') for entry in entries):
+        # A single opaque mapping hash binds sources without revealing which label is the App sample.
+        input_seal['source_validation'] = {'policy':'app-final-answer-v1', 'mapping_sha256':sha(private_mapping)}
+    write(packet/'input-seal.json', input_seal)
     write(packet/'progress.json', {'completed':[], 'planned':len(mapping)})
     return {'packet':str(packet), 'answers':len(mapping), 'private_mapping_sha256':sha(private_mapping),
             'input_seal_sha256':sha(packet/'input-seal.json')}
 
 
-def check_topic_seal(packet, expected_input_seal_sha256=None):
+def check_topic_seal(packet, expected_input_seal_sha256=None, private_mapping=None):
     packet = Path(packet)
     seal = read(packet/'seal.json')
     if expected_input_seal_sha256 is not None:
@@ -155,6 +163,19 @@ def check_topic_seal(packet, expected_input_seal_sha256=None):
     require(seal['review_protocol'] == REVIEW_PROTOCOL and sha(packet/'scores.json') == seal['scores_sha256'], 'Fresh topic score seal changed')
     require(sha(packet/'input-seal.json') == seal['input_seal_sha256'], 'Fresh topic input seal changed')
     inputs = read(packet/'input-seal.json')
+    source_validation = inputs.get('source_validation')
+    if source_validation is not None:
+        require(source_validation.get('policy') == 'app-final-answer-v1'
+                and private_mapping is not None, 'App topic export requires coordinator private mapping')
+        require(sha(private_mapping) == source_validation.get('mapping_sha256'),
+                'App topic private mapping differs from frozen source binding')
+        entries = read(private_mapping)['entries']
+        require(set(entries) == set(seal['reviews_sha256']), 'App topic source coverage differs')
+        for label, entry in entries.items():
+            require(sha(entry['answer']) == entry['answer_sha256'], 'Original App topic answer changed')
+            validate_answer_entry(entry)
+            require(sha(packet/'answers'/(label+'.txt')) == entry['view_sha256'],
+                    'App topic anonymous view changed')
     for name, expected in inputs['files_sha256'].items():
         require(sha(inside(packet,name)) == expected, 'Fresh topic input changed: '+name)
     scores = read(packet/'scores.json')

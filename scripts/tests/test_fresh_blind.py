@@ -15,6 +15,16 @@ from test_scoring_v3 import sample_score, v3_gold
 
 
 class FreshBlindTests(unittest.TestCase):
+    def test_frozen_question_link_hides_backend_prefix_but_keeps_file_and_line(self):
+        raw='[S10](<C:/Users/a/AppData/Local/agy-benchmark-work/opaque/readonly/newjoy/prompt.txt:586>)'
+        view, edits=anonymous_view(raw)
+        self.assertEqual(view,'[S10](<materials/newjoy/prompt.txt:586>)')
+        self.assertEqual(restore_quote(view,view,raw,edits),raw)
+        plain='[question](C:\\Temp\\agy-benchmark-work\\opaque\\readonly\\question.txt#L6)'
+        v,e=anonymous_view(plain)
+        self.assertEqual(v,'[question](materials/question.txt#L6)')
+        self.assertEqual(restore_quote(v,v,plain,e),plain)
+
     def test_identity_prefixes_hidden_and_quotes_return_to_original_bytes(self):
         raw='结论 [x](file:///C:/Users/a/agy-benchmark-work/id/readonly/source/engineering/UE/x.cpp#L12) 和 /C:/Temp/codex-benchmark-id/scratch/local_test.py'
         view, edits=anonymous_view(raw)
@@ -27,6 +37,19 @@ class FreshBlindTests(unittest.TestCase):
         self.assertIn(restored,raw);self.assertIn('x.cpp#L12',restored)
         args=parser().parse_args(['validate-topic','--packet','packet'])
         self.assertEqual(args.packet,'packet')
+
+    def test_snapshot_source_links_hide_trial_identity_and_restore_exact_quotes(self):
+        raw=(r'[UE](C:/Users/a/benchmarks/newjoy-ab/input/source-snapshot/engineering/UE/x.cpp:12)'
+             r' and C:\Users\a\benchmarks\newjoy-ab\input\source-snapshot\engineering\UE\x.cpp:12'
+             r' and C:/Assets/source-snapshot/textures/ui.png')
+        view,edits=anonymous_view(raw)
+        self.assertNotIn('newjoy-ab',view)
+        self.assertIn('frozen/engineering/UE/x.cpp:12',view)
+        self.assertIn('frozen/engineering\\UE\\x.cpp:12',view)
+        self.assertIn('C:/Assets/source-snapshot/textures/ui.png',view)
+        self.assertEqual(restore_quote(view,view,raw,edits),raw)
+        quote='[UE](frozen/engineering/UE/x.cpp:12)'
+        self.assertIn(restore_quote(quote,view,raw,edits),raw)
 
     def test_packet_seal_has_no_history_and_detects_tampering(self):
         # Fixture gold is synthetic; no historical scoring records enter the packet.

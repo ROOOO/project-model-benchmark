@@ -46,6 +46,12 @@ def parser():
     scope = listing.add_mutually_exclusive_group()
     scope.add_argument("--root", help="Scan nested batches; defaults to the benchmark root")
     scope.add_argument("--run-dirs", nargs="+", help="Inspect only these exact batch roots")
+    capture = sub.add_parser("capture-app-answer", help="Archive one completed App final verbatim; no inference")
+    capture.add_argument("--message-json", required=True, help="Allowlisted full read_thread final-message receipt")
+    capture.add_argument("--completion-json", required=True, help="Allowlisted wait_threads completion metadata")
+    capture.add_argument("--thread-id", required=True)
+    capture.add_argument("--turn-id", required=True)
+    capture.add_argument("--output-dir", required=True)
     revision = sub.add_parser("regrade", help="Prepare an isolated offline scoring revision; never starts inference")
     revision.add_argument("--run-dir", required=True)
     revision.add_argument("--rubric", required=True)
@@ -63,6 +69,7 @@ def parser():
     topic_check = sub.add_parser("validate-topic", help="Validate a sealed independent anonymous topic review")
     topic_check.add_argument("--packet", required=True)
     topic_check.add_argument("--expected-input-seal-sha256")
+    topic_check.add_argument("--private-mapping", help="Coordinator-only original/capture validation; required for new App captures")
     comparison = sub.add_parser("compare", help="Create a separate offline comparison from sealed runs; never starts inference")
     comparison.add_argument("--run-dirs", nargs="+", required=True)
     comparison.add_argument("--output", required=True)
@@ -151,6 +158,10 @@ def main(argv=None):
         value = topic_history(args.root)
     elif args.command == "inventory":
         value = inventory(root=args.root, run_dirs=args.run_dirs)
+    elif args.command == "capture-app-answer":
+        from app_capture import capture_app_answer
+        value = capture_app_answer(args.message_json, args.completion_json, args.output_dir,
+                                   args.thread_id, args.turn_id)
     elif args.command == "regrade":
         options = {"condition_filter": args.condition_filter} if args.condition_filter else {}
         if args.scores_from:
@@ -163,7 +174,7 @@ def main(argv=None):
         value = prepare_topic(read(args.entries_json), args.rubric, args.packet, args.private_mapping)
     elif args.command == "validate-topic":
         from fresh_blind import check_topic_seal
-        value = check_topic_seal(args.packet, args.expected_input_seal_sha256)
+        value = check_topic_seal(args.packet, args.expected_input_seal_sha256, args.private_mapping)
     elif args.command == "compare":
         options = {}
         if args.estimate_answer_tps:

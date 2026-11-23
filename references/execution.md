@@ -134,6 +134,62 @@ benchmark.py validate --run-dir <run>
 
 ## 已有答案离线重审
 
+### App 最终回复采集
+
+仅用于用户明确授权的 App 新对话测试，离线采集不创建对话或发起模型调用。答题指令统一为：
+
+> 只在最终回复中生成一份完整技术答案，不另写 answer.txt，也不在回复末尾重复另一版正文。技术答案不包含模型、测试来源、协作过程、自评分或交付文件链接。流程审计按指定位置单独保存。协调端等待本次 turn 完成后取得完整最终回复，原样归档并提供文件入口。
+
+协调端通过 `wait_threads` 确认本次 turn 成功完成；该工具的消息文字可能是摘要或已截断，不能用作正文。再用 `read_thread` 读取目标 turn 的完整 `final_answer`，必要时扩大读取字符上限。仍不完整时等待核实，不从delta拼接、不让模型再生成。两次响应在内存中过滤成下列白名单，过滤前不落盘整份聊天、工具输出或私有推理。
+
+`message.json`：
+
+```json
+{
+  "thread": {"id": "<thread-id>", "hostId": "<host-id>"},
+  "turns": [{
+    "id": "<turn-id>", "status": "completed", "error": null,
+    "items": [{
+      "type": "agentMessage", "id": "<message-id>", "phase": "final_answer",
+      "text": "<完整原始正文>", "truncated": false
+    }]
+  }]
+}
+```
+
+`completion.json`：
+
+```json
+{
+  "polls": [{
+    "thread": {"id": "<thread-id>", "hostId": "<host-id>"},
+    "latestTurn": {"id": "<turn-id>", "status": "completed", "error": null},
+    "latestAssistantMessageId": "<message-id>",
+    "latestAssistantMessage": {
+      "id": "<message-id>", "turnId": "<turn-id>", "phase": "final_answer"
+    }
+  }]
+}
+```
+
+只接收同一host／线程／turn及唯一最终消息；显式保存 `truncated:false` 须依据完整读取响应，不能把截断标记清掉。完成回执可附 `startedAt/completedAt/durationMs`，不附摘要文字。
+
+若同轮读取结果含多个被标为`final_answer`的公开条目，只选择成功终态回执的`latestAssistantMessageId`明确指向且完整读取的那一条；更早条目不拼接进入正文，另记排除条目的ID及选择依据。权威ID缺失、不匹配、重复或正文仍截断时拒绝采集，先核实而不重新生成。
+
+```text
+benchmark.py capture-app-answer --message-json <message.json> --completion-json <completion.json> --thread-id <thread-id> --turn-id <turn-id> --output-dir <新采集目录>
+```
+
+输出 `answer.txt`、两份公开来源回执和 `answer-receipt.json`。正文严格按UTF-8原样写入，包括首尾空白及原始换行；来源ID和SHA256共同绑定。命令只采集已有回复，不是新采样。重复同一来源时核验并复用，目标有不同来源、内容冲突或不完整写入时拒绝覆盖。
+
+匿名包entries纳入命令返回的 `answer_source/answer_receipt/answer_receipt_sha256` 以及 `answer/answer_sha256`；相邻捕获回执也会自动识别。准备时核验原文与回执，来源映射留在packet之外，packet只保存不暴露样本身份的映射哈希。评分者继续仅检查匿名包中的冻结输入；协调端导出前必须执行：
+
+```text
+benchmark.py validate-topic --packet <packet> --expected-input-seal-sha256 <预存哈希> --private-mapping <私有映射.json>
+```
+
+新App包缺映射、原文变动或来源回执不符均拒绝通过；旧包不要求新增字段。现有CLI/App-server和Antigravity仍使用各自已完成的最终答案提取，不改写历史样本。已有封存答案若采用文件为准，继续保持原口径；新规则只用于新的采集目录，不能据此换掉已经评分的原文。
+
 ### 全新按题盲评
 
 `blind-topic --entries-json <entries.json> --rubric <formal-v3.json> --packet <clean-directory> --private-mapping <outside-packet.json>`生成单题多批匿名包。entries为列表，每项含稳定`identity`、冻结批次`source`、原答案`answer`和`answer_sha256`，可附原slot／result来源。题面及prompt必须一致。原文不改；视图仅替换来源路径前缀，私有映射记录替换区间和原文／视图哈希。引用导回原文时通过区间回溯，不能直接把脱敏文本覆盖原答案。

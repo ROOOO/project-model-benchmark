@@ -20,6 +20,7 @@ import zipfile
 from core import DIMENSION_LABELS, METRICS, V3_METRICS, all_attempts, check_inputs, check_sensitive, chosen_attempts, digest, distribution, evaluation_schedule, inside, metric_keys, metrics_for_protocol, now, price_for, principle_score, protocol_tiers, read, require, score_sum, scoring_gold, scoring_weights, sha, three_dimension_scoring, usage_issues, validate_scores, write
 from runtime import still_running
 from billing import SUBSCRIPTION_LABEL, SUBSCRIPTION_METRICS, billing_context, format_usd, subscription_export, subscription_view
+from app_capture import validate_answer_entry
 
 
 CSV_FIELDS = list(dict.fromkeys(["slot_id", "attempt", "model", "effort", "repetition", "status", "valid", "selected", "accuracy", "readability", "quality", "anonymous_id", "actual_gateway_charge", *METRICS, "answer_link"]))
@@ -289,6 +290,7 @@ def check_packet(root):
         source = inside(root, relative).parent / "answer.txt"
         actual = sha(source)
         require(actual == record.get("answer_sha256"), "Raw answer differs from recorded hash")
+        validate_answer_entry({**record, "answer":str(source)})
         require(record.get("prompt_sha256") == protocol["input_hashes"]["prompt.txt"], "Recorded prompt differs from frozen input")
         destination = inside(answers, anon + ".txt")
         require(destination.is_file() and sha(destination) == actual, "Anonymous answer differs from original answer")
@@ -906,6 +908,7 @@ def validate_records(root):
         directory = inside(root, r["relative_result"]).parent
         answer = (directory / "answer.txt").read_text(encoding="utf-8")
         require(sha(directory / "answer.txt") == r["answer_sha256"] and r["prompt_sha256"] == sha(root / "input/prompt.txt"), "Answer/prompt hash mismatch")
+        validate_answer_entry({**r, "answer":str(directory / "answer.txt")})
         if r.get("thread_id"):
             require(r["thread_id"] not in tids, "Thread reused between attempts")
             tids.add(r["thread_id"])
