@@ -52,6 +52,23 @@ def parser():
     capture.add_argument("--thread-id", required=True)
     capture.add_argument("--turn-id", required=True)
     capture.add_argument("--output-dir", required=True)
+    paired_prepare = sub.add_parser("paired-prepare", help="Freeze an authorized matched App review batch; no inference")
+    paired_prepare.add_argument("--selection", required=True)
+    paired_prepare.add_argument("--comparison", required=True)
+    paired_prepare.add_argument("--batch-dir", required=True)
+    paired_prepare.add_argument("--pilot", required=True)
+    for command in ("paired-status", "paired-next", "paired-register", "paired-collect", "paired-blind", "paired-grade-next", "paired-grade-complete", "paired-verify", "paired-report"):
+        q = sub.add_parser(command)
+        q.add_argument("--batch-dir", required=True)
+        if command in ("paired-register", "paired-collect", "paired-grade-complete"):
+            q.add_argument("--unit", required=True)
+        if command == "paired-register":
+            q.add_argument("--thread-id", required=True)
+            q.add_argument("--host-id", default="local")
+            q.add_argument("--grading", action="store_true")
+        if command == "paired-collect":
+            q.add_argument("--message-json", required=True)
+            q.add_argument("--completion-json", required=True)
     revision = sub.add_parser("regrade", help="Prepare an isolated offline scoring revision; never starts inference")
     revision.add_argument("--run-dir", required=True)
     revision.add_argument("--rubric", required=True)
@@ -135,7 +152,31 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
-    if args.command.startswith("study-"):
+    if args.command.startswith("paired-"):
+        import paired
+        command = args.command
+        if command == "paired-prepare":
+            value = paired.prepare(args.selection, args.comparison, args.batch_dir, args.pilot)
+        elif command == "paired-status":
+            value = paired.status(args.batch_dir)
+        elif command == "paired-next":
+            value = paired.dispatch(args.batch_dir)
+        elif command == "paired-register":
+            value = paired.register(args.batch_dir, args.unit, args.thread_id, args.host_id, args.grading)
+        elif command == "paired-collect":
+            value = paired.collect(args.batch_dir, args.unit, args.message_json, args.completion_json)
+        elif command == "paired-blind":
+            value = paired.blind(args.batch_dir)
+        elif command == "paired-grade-next":
+            value = paired.grade_dispatch(args.batch_dir)
+        elif command == "paired-grade-complete":
+            value = paired.grade_complete(args.batch_dir, args.unit)
+        elif command == "paired-report":
+            from paired_report import export
+            value = export(args.batch_dir)
+        else:
+            value = paired.verify(args.batch_dir)
+    elif args.command.startswith("study-"):
         import study
         if args.command == "study-prepare":
             value = study.prepare(args.source_runs, args.study_dir, args.model, args.effort, args.cycles,
